@@ -582,11 +582,31 @@ const LeafBatchContext = struct {
     total_len: usize, // Total length of input data (for boundary checking)
 };
 
+/// Helper function to process N leaves in parallel, reducing code duplication
+inline fn processNLeaves(
+    comptime Variant: type,
+    comptime N: usize,
+    view: *const MultiSliceView,
+    j: usize,
+    leaf_buffer: []u8,
+    output: []u8,
+) void {
+    const cv_size = Variant.cv_size;
+    if (view.tryGetSlice(j, j + N * B)) |leaf_data| {
+        var leaf_cvs: [N * cv_size]u8 = undefined;
+        processLeaves(Variant, N, leaf_data, &leaf_cvs);
+        @memcpy(output[0..leaf_cvs.len], &leaf_cvs);
+    } else {
+        view.copyRange(j, j + N * B, leaf_buffer[0 .. N * B]);
+        var leaf_cvs: [N * cv_size]u8 = undefined;
+        processLeaves(Variant, N, leaf_buffer[0 .. N * B], &leaf_cvs);
+        @memcpy(output[0..leaf_cvs.len], &leaf_cvs);
+    }
+}
+
 /// Process a batch of leaves in a single thread using SIMD (NO ALLOCATIONS!)
 fn processLeafBatch(ctx: LeafBatchContext) void {
-    // Use first part of scratch buffer for leaf data
     const leaf_buffer = ctx.scratch_buffer[0 .. 8 * B];
-    // Use second part for chaining value output
     const cv_size: usize = if (ctx.kt_variant == .kt128) 32 else 64;
     const cv_scratch = ctx.scratch_buffer[8 * B .. 8 * B + cv_size];
 
@@ -598,92 +618,35 @@ fn processLeafBatch(ctx: LeafBatchContext) void {
     while (j < batch_end) {
         const remaining = batch_end - j;
 
-        if (optimal_vector_len >= 8 and remaining >= 8 * B and ctx.kt_variant == .kt128) {
-            // Process 8 leaves in parallel (KT128)
-            if (ctx.view.tryGetSlice(j, j + 8 * B)) |leaf_data| {
-                var leaf_cvs: [8 * 32]u8 = undefined;
-                processLeaves(KT128Variant, 8, leaf_data, &leaf_cvs);
-                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+        if (optimal_vector_len >= 8 and remaining >= 8 * B) {
+            if (ctx.kt_variant == .kt128) {
+                processNLeaves(KT128Variant, 8, ctx.view, j, leaf_buffer, ctx.output_cvs[cvs_offset..]);
+                cvs_offset += 8 * 32;
             } else {
-                ctx.view.copyRange(j, j + 8 * B, leaf_buffer[0 .. 8 * B]);
-                var leaf_cvs: [8 * 32]u8 = undefined;
-                processLeaves(KT128Variant, 8, leaf_buffer[0 .. 8 * B], &leaf_cvs);
-                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+                processNLeaves(KT256Variant, 8, ctx.view, j, leaf_buffer, ctx.output_cvs[cvs_offset..]);
+                cvs_offset += 8 * 64;
             }
-            cvs_offset += 8 * 32;
             j += 8 * B;
-        } else if (optimal_vector_len >= 8 and remaining >= 8 * B and ctx.kt_variant == .kt256) {
-            // Process 8 leaves in parallel (KT256)
-            if (ctx.view.tryGetSlice(j, j + 8 * B)) |leaf_data| {
-                var leaf_cvs: [8 * 64]u8 = undefined;
-                processLeaves(KT256Variant, 8, leaf_data, &leaf_cvs);
-                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+        } else if (optimal_vector_len >= 4 and remaining >= 4 * B) {
+            if (ctx.kt_variant == .kt128) {
+                processNLeaves(KT128Variant, 4, ctx.view, j, leaf_buffer, ctx.output_cvs[cvs_offset..]);
+                cvs_offset += 4 * 32;
             } else {
-                ctx.view.copyRange(j, j + 8 * B, leaf_buffer[0 .. 8 * B]);
-                var leaf_cvs: [8 * 64]u8 = undefined;
-                processLeaves(KT256Variant, 8, leaf_buffer[0 .. 8 * B], &leaf_cvs);
-                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+                processNLeaves(KT256Variant, 4, ctx.view, j, leaf_buffer, ctx.output_cvs[cvs_offset..]);
+                cvs_offset += 4 * 64;
             }
-            cvs_offset += 8 * 64;
-            j += 8 * B;
-        } else if (optimal_vector_len >= 4 and remaining >= 4 * B and ctx.kt_variant == .kt128) {
-            // Process 4 leaves in parallel (KT128)
-            if (ctx.view.tryGetSlice(j, j + 4 * B)) |leaf_data| {
-                var leaf_cvs: [4 * 32]u8 = undefined;
-                processLeaves(KT128Variant, 4, leaf_data, &leaf_cvs);
-                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
-            } else {
-                ctx.view.copyRange(j, j + 4 * B, leaf_buffer[0 .. 4 * B]);
-                var leaf_cvs: [4 * 32]u8 = undefined;
-                processLeaves(KT128Variant, 4, leaf_buffer[0 .. 4 * B], &leaf_cvs);
-                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
-            }
-            cvs_offset += 4 * 32;
             j += 4 * B;
-        } else if (optimal_vector_len >= 4 and remaining >= 4 * B and ctx.kt_variant == .kt256) {
-            // Process 4 leaves in parallel (KT256)
-            if (ctx.view.tryGetSlice(j, j + 4 * B)) |leaf_data| {
-                var leaf_cvs: [4 * 64]u8 = undefined;
-                processLeaves(KT256Variant, 4, leaf_data, &leaf_cvs);
-                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+        } else if (optimal_vector_len >= 2 and remaining >= 2 * B) {
+            if (ctx.kt_variant == .kt128) {
+                processNLeaves(KT128Variant, 2, ctx.view, j, leaf_buffer, ctx.output_cvs[cvs_offset..]);
+                cvs_offset += 2 * 32;
             } else {
-                ctx.view.copyRange(j, j + 4 * B, leaf_buffer[0 .. 4 * B]);
-                var leaf_cvs: [4 * 64]u8 = undefined;
-                processLeaves(KT256Variant, 4, leaf_buffer[0 .. 4 * B], &leaf_cvs);
-                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+                processNLeaves(KT256Variant, 2, ctx.view, j, leaf_buffer, ctx.output_cvs[cvs_offset..]);
+                cvs_offset += 2 * 64;
             }
-            cvs_offset += 4 * 64;
-            j += 4 * B;
-        } else if (optimal_vector_len >= 2 and remaining >= 2 * B and ctx.kt_variant == .kt128) {
-            // Process 2 leaves in parallel (KT128)
-            if (ctx.view.tryGetSlice(j, j + 2 * B)) |leaf_data| {
-                var leaf_cvs: [2 * 32]u8 = undefined;
-                processLeaves(KT128Variant, 2, leaf_data, &leaf_cvs);
-                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
-            } else {
-                ctx.view.copyRange(j, j + 2 * B, leaf_buffer[0 .. 2 * B]);
-                var leaf_cvs: [2 * 32]u8 = undefined;
-                processLeaves(KT128Variant, 2, leaf_buffer[0 .. 2 * B], &leaf_cvs);
-                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
-            }
-            cvs_offset += 2 * 32;
-            j += 2 * B;
-        } else if (optimal_vector_len >= 2 and remaining >= 2 * B and ctx.kt_variant == .kt256) {
-            // Process 2 leaves in parallel (KT256)
-            if (ctx.view.tryGetSlice(j, j + 2 * B)) |leaf_data| {
-                var leaf_cvs: [2 * 64]u8 = undefined;
-                processLeaves(KT256Variant, 2, leaf_data, &leaf_cvs);
-                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
-            } else {
-                ctx.view.copyRange(j, j + 2 * B, leaf_buffer[0 .. 2 * B]);
-                var leaf_cvs: [2 * 64]u8 = undefined;
-                processLeaves(KT256Variant, 2, leaf_buffer[0 .. 2 * B], &leaf_cvs);
-                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
-            }
-            cvs_offset += 2 * 64;
             j += 2 * B;
         } else {
-            // Process single leaf (NO ALLOCATION!)
+            // Process single leaf
             const chunk_len = @min(B, batch_end - j);
             if (ctx.view.tryGetSlice(j, j + chunk_len)) |leaf_data| {
                 const cv_slice = MultiSliceView.init(leaf_data, &[_]u8{}, &[_]u8{});
