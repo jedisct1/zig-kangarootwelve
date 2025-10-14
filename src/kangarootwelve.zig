@@ -348,10 +348,9 @@ fn keccakP(state: *[200]u8) void {
     }
 }
 
-/// Non-allocating TurboSHAKE128: write output to provided buffer
-fn turboSHAKE128MultiSliceToBuffer(view: *const MultiSliceView, separation_byte: u8, output: []u8) void {
+/// Generic non-allocating TurboSHAKE: write output to provided buffer
+fn turboSHAKEMultiSliceToBuffer(comptime rate: usize, view: *const MultiSliceView, separation_byte: u8, output: []u8) void {
     var state = [_]u8{0} ** 200;
-    const rate: usize = 168;
     var state_pos: usize = 0;
 
     // Absorb all bytes from the multi-slice view
@@ -383,156 +382,94 @@ fn turboSHAKE128MultiSliceToBuffer(view: *const MultiSliceView, separation_byte:
             keccakP(&state);
         }
     }
+}
+
+/// Generic allocating TurboSHAKE
+fn turboSHAKEMultiSlice(comptime rate: usize, allocator: std.mem.Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
+    const output = try allocator.alloc(u8, output_len);
+    turboSHAKEMultiSliceToBuffer(rate, view, separation_byte, output);
+    return output;
+}
+
+/// Non-allocating TurboSHAKE128: write output to provided buffer
+fn turboSHAKE128MultiSliceToBuffer(view: *const MultiSliceView, separation_byte: u8, output: []u8) void {
+    turboSHAKEMultiSliceToBuffer(168, view, separation_byte, output);
 }
 
 /// Allocating TurboSHAKE128
 fn turboSHAKE128MultiSlice(allocator: std.mem.Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
-    const output = try allocator.alloc(u8, output_len);
-    turboSHAKE128MultiSliceToBuffer(view, separation_byte, output);
-    return output;
+    return turboSHAKEMultiSlice(168, allocator, view, separation_byte, output_len);
 }
 
 /// Non-allocating TurboSHAKE256: write output to provided buffer
 fn turboSHAKE256MultiSliceToBuffer(view: *const MultiSliceView, separation_byte: u8, output: []u8) void {
-    var state = [_]u8{0} ** 200;
-    const rate: usize = 136;
-    var state_pos: usize = 0;
-
-    // Absorb all bytes from the multi-slice view
-    const total = view.totalLen();
-    var pos: usize = 0;
-    while (pos < total) {
-        state[state_pos] ^= view.getByte(pos);
-        state_pos += 1;
-        pos += 1;
-
-        if (state_pos == rate) {
-            keccakP(&state);
-            state_pos = 0;
-        }
-    }
-
-    // Add separation byte and padding
-    state[state_pos] ^= separation_byte;
-    state[rate - 1] ^= 0x80;
-    keccakP(&state);
-
-    // Squeeze
-    var out_offset: usize = 0;
-    while (out_offset < output.len) {
-        const chunk = @min(rate, output.len - out_offset);
-        @memcpy(output[out_offset..][0..chunk], state[0..chunk]);
-        out_offset += chunk;
-        if (out_offset < output.len) {
-            keccakP(&state);
-        }
-    }
+    turboSHAKEMultiSliceToBuffer(136, view, separation_byte, output);
 }
 
 /// Allocating TurboSHAKE256
 fn turboSHAKE256MultiSlice(allocator: std.mem.Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
-    const output = try allocator.alloc(u8, output_len);
-    turboSHAKE256MultiSliceToBuffer(view, separation_byte, output);
-    return output;
+    return turboSHAKEMultiSlice(136, allocator, view, separation_byte, output_len);
 }
 
 // ============================================================================
 // Streaming TurboSHAKE state structures for incremental absorption
 // ============================================================================
 
-/// Streaming TurboSHAKE128 state for incremental hashing (no allocations)
-pub const TurboSHAKE128State = struct {
-    state: [200]u8,
-    state_pos: usize,
-    const rate: usize = 168;
+/// Generic streaming TurboSHAKE state for incremental hashing
+fn TurboSHAKEState(comptime rate: usize) type {
+    return struct {
+        state: [200]u8,
+        state_pos: usize,
 
-    /// Initialize a new TurboSHAKE128 state
-    pub fn init() TurboSHAKE128State {
-        return .{
-            .state = [_]u8{0} ** 200,
-            .state_pos = 0,
-        };
-    }
+        const Self = @This();
 
-    /// Absorb data incrementally (can be called multiple times)
-    pub fn update(self: *TurboSHAKE128State, data: []const u8) void {
-        for (data) |byte| {
-            self.state[self.state_pos] ^= byte;
-            self.state_pos += 1;
+        /// Initialize a new TurboSHAKE state
+        pub fn init() Self {
+            return .{
+                .state = [_]u8{0} ** 200,
+                .state_pos = 0,
+            };
+        }
 
-            if (self.state_pos == rate) {
-                keccakP(&self.state);
-                self.state_pos = 0;
+        /// Absorb data incrementally (can be called multiple times)
+        pub fn update(self: *Self, data: []const u8) void {
+            for (data) |byte| {
+                self.state[self.state_pos] ^= byte;
+                self.state_pos += 1;
+
+                if (self.state_pos == rate) {
+                    keccakP(&self.state);
+                    self.state_pos = 0;
+                }
             }
         }
-    }
 
-    /// Finalize and squeeze output (consumes the state)
-    pub fn finalize(self: *TurboSHAKE128State, separation_byte: u8, output: []u8) void {
-        // Add separation byte and padding
-        self.state[self.state_pos] ^= separation_byte;
-        self.state[rate - 1] ^= 0x80;
-        keccakP(&self.state);
+        /// Finalize and squeeze output (consumes the state)
+        pub fn finalize(self: *Self, separation_byte: u8, output: []u8) void {
+            // Add separation byte and padding
+            self.state[self.state_pos] ^= separation_byte;
+            self.state[rate - 1] ^= 0x80;
+            keccakP(&self.state);
 
-        // Squeeze
-        var out_offset: usize = 0;
-        while (out_offset < output.len) {
-            const chunk = @min(rate, output.len - out_offset);
-            @memcpy(output[out_offset..][0..chunk], self.state[0..chunk]);
-            out_offset += chunk;
-            if (out_offset < output.len) {
-                keccakP(&self.state);
+            // Squeeze
+            var out_offset: usize = 0;
+            while (out_offset < output.len) {
+                const chunk = @min(rate, output.len - out_offset);
+                @memcpy(output[out_offset..][0..chunk], self.state[0..chunk]);
+                out_offset += chunk;
+                if (out_offset < output.len) {
+                    keccakP(&self.state);
+                }
             }
         }
-    }
-};
+    };
+}
 
-/// Streaming TurboSHAKE256 state for incremental hashing (no allocations)
-pub const TurboSHAKE256State = struct {
-    state: [200]u8,
-    state_pos: usize,
-    const rate: usize = 136;
+/// Streaming TurboSHAKE128 state for incremental hashing
+pub const TurboSHAKE128State = TurboSHAKEState(168);
 
-    /// Initialize a new TurboSHAKE256 state
-    pub fn init() TurboSHAKE256State {
-        return .{
-            .state = [_]u8{0} ** 200,
-            .state_pos = 0,
-        };
-    }
-
-    /// Absorb data incrementally (can be called multiple times)
-    pub fn update(self: *TurboSHAKE256State, data: []const u8) void {
-        for (data) |byte| {
-            self.state[self.state_pos] ^= byte;
-            self.state_pos += 1;
-
-            if (self.state_pos == rate) {
-                keccakP(&self.state);
-                self.state_pos = 0;
-            }
-        }
-    }
-
-    /// Finalize and squeeze output (consumes the state)
-    pub fn finalize(self: *TurboSHAKE256State, separation_byte: u8, output: []u8) void {
-        // Add separation byte and padding
-        self.state[self.state_pos] ^= separation_byte;
-        self.state[rate - 1] ^= 0x80;
-        keccakP(&self.state);
-
-        // Squeeze
-        var out_offset: usize = 0;
-        while (out_offset < output.len) {
-            const chunk = @min(rate, output.len - out_offset);
-            @memcpy(output[out_offset..][0..chunk], self.state[0..chunk]);
-            out_offset += chunk;
-            if (out_offset < output.len) {
-                keccakP(&self.state);
-            }
-        }
-    }
-};
+/// Streaming TurboSHAKE256 state for incremental hashing
+pub const TurboSHAKE256State = TurboSHAKEState(136);
 
 // ============================================================================
 // SIMD leaf processing
