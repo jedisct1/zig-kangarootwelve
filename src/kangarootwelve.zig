@@ -1,559 +1,1237 @@
 const std = @import("std");
-const assert = std.debug.assert;
-const crypto = std.crypto;
-const mem = std.mem;
-const sha3 = std.crypto.hash.sha3;
+const builtin = @import("builtin");
+const Thread = std.Thread;
+const Pool = Thread.Pool;
+const WaitGroup = Thread.WaitGroup;
 
-const chunk_size = 8192;
+// ============================================================================
+// Constants
+// ============================================================================
 
-fn getChunkFromCombinedInput(message: []const u8, customization: []const u8, encoded_len: []const u8, pos: usize, len: usize) []const u8 {
-    const msg_len = message.len;
-    const custom_len = customization.len;
-    const enc_len = encoded_len.len;
+const B: usize = 8192; // Chunk size for tree hashing (8 KiB)
+const CACHE_LINE_SIZE = 64; // Common cache line size for x86_64 and ARM
 
-    if (pos < msg_len) {
-        // Chunk starts in message
-        const msg_end = @min(pos + len, msg_len);
-        const msg_part_len = msg_end - pos;
-        if (msg_part_len == len) {
-            // Chunk is entirely within message
-            return message[pos..msg_end];
-        }
-        // Chunk spans into customization
-        return message[pos..msg_end]; // Return just the message part for now
-    } else if (pos < msg_len + custom_len) {
-        // Chunk starts in customization
-        const custom_start = pos - msg_len;
-        const custom_end = @min(custom_start + len, custom_len);
-        return customization[custom_start..custom_end];
+// Optimal SIMD vector length for u64 on this target platform
+const optimal_vector_len = std.simd.suggestVectorLength(u64) orelse 1;
+
+// Dynamic multi-threading threshold based on CPU count
+fn getLargeFileThreshold() usize {
+    const cpu_count = Thread.getCpuCount() catch 1;
+    if (cpu_count >= 8) {
+        return 25 * 1024 * 1024; // 25 MB for 8+ cores
+    } else if (cpu_count >= 4) {
+        return 35 * 1024 * 1024; // 35 MB for 4-7 cores
     } else {
-        // Chunk starts in encoded length
-        const enc_start = pos - msg_len - custom_len;
-        const enc_end = @min(enc_start + len, enc_len);
-        return encoded_len[enc_start..enc_end];
+        return 50 * 1024 * 1024; // 50 MB for 1-3 cores
     }
 }
 
-fn encodeLength(buf: *[9]u8, len: usize) usize {
-    var x: u64 = @intCast(len);
-    var temp: [8]u8 = undefined;
-    var i: usize = 0;
+// Round constants for Keccak-p[1600,12]
+const RC = [12]u64{
+    0x000000008000808B,
+    0x800000000000008B,
+    0x8000000000008089,
+    0x8000000000008003,
+    0x8000000000008002,
+    0x8000000000000080,
+    0x000000000000800A,
+    0x800000008000000A,
+    0x8000000080008081,
+    0x8000000000008080,
+    0x0000000080000001,
+    0x8000000080008008,
+};
 
-    while (x > 0) : (i += 1) {
-        temp[i] = @truncate(x);
-        x >>= 8;
-    }
-    var j: usize = 0;
-    while (j < i) : (j += 1) {
-        buf[j] = temp[i - 1 - j];
-    }
-    buf[i] = @intCast(i);
-    return i + 1;
+// ============================================================================
+// Core SIMD utilities
+// ============================================================================
+
+/// Rotate left for u64 vector
+inline fn rol64Vec(comptime N: usize, v: @Vector(N, u64), comptime n: u6) @Vector(N, u64) {
+    if (n == 0) return v;
+    const left: @Vector(N, u64) = @splat(n);
+    const right_shift: u64 = 64 - @as(u64, n);
+    const right: @Vector(N, u64) = @splat(right_shift);
+    return (v << left) | (v >> right);
 }
 
-pub const KTInput = struct {
-    m: []const u8,
-    c: []const u8,
-    len_buf: [9]u8 = undefined,
-    len_len: usize = 0,
-    pos: usize = 0,
+/// Load a 64-bit little-endian value
+inline fn load64(bytes: []const u8) u64 {
+    std.debug.assert(bytes.len >= 8);
+    return std.mem.readInt(u64, bytes[0..8], .little);
+}
 
-    pub fn init(m: []const u8, c: []const u8) KTInput {
-        var self = KTInput{
-            .m = m,
-            .c = c,
-        };
-        self.len_len = encodeLength(&self.len_buf, c.len);
-        return self;
-    }
+/// Store a 64-bit little-endian value
+inline fn store64(value: u64, bytes: []u8) void {
+    std.debug.assert(bytes.len >= 8);
+    std.mem.writeInt(u64, bytes[0..8], value, .little);
+}
 
-    pub fn len(self: KTInput) usize {
-        return self.m.len + self.c.len + self.len_len;
-    }
+/// Right-encode result type (max 9 bytes for 64-bit usize)
+const RightEncoded = struct {
+    bytes: [9]u8,
+    len: u8,
 
-    pub fn remaining(self: KTInput) usize {
-        return self.len() - self.pos;
-    }
-
-    pub fn read(self: *KTInput, out: []u8) []const u8 {
-        const c_pos = self.m.len;
-        const len_slice_pos = c_pos + self.c.len;
-        var out_idx: usize = 0;
-        var left = out.len;
-
-        if (self.pos < c_pos) {
-            @branchHint(.likely);
-            if (self.pos + out.len <= c_pos) {
-                @branchHint(.likely);
-                const ret = self.m[self.pos..][0..out.len];
-                self.pos += out.len;
-                return ret;
-            }
-            const to_read = @min(left, c_pos - self.pos);
-            @memcpy(out[out_idx..][0..to_read], self.m[self.pos..][0..to_read]);
-            self.pos += to_read;
-            out_idx += to_read;
-            left -= to_read;
-        }
-        if (self.pos >= c_pos and self.pos < len_slice_pos) {
-            const to_read = @min(left, len_slice_pos - self.pos);
-            @memcpy(out[out_idx..][0..to_read], self.c[self.pos - c_pos ..][0..to_read]);
-            self.pos += to_read;
-            out_idx += to_read;
-            left -= to_read;
-        }
-        if (self.pos >= len_slice_pos) {
-            const to_read = @min(left, self.len() - self.pos);
-            @memcpy(out[out_idx..][0..to_read], self.len_buf[self.pos - len_slice_pos ..][0..to_read]);
-            self.pos += to_read;
-            out_idx += to_read;
-        }
-        return out[0..out_idx];
+    fn slice(self: *const RightEncoded) []const u8 {
+        return self.bytes[0..self.len];
     }
 };
 
-/// KT128 (KangarooTwelve) is a tree-hashing mode on top of TurboSHAKE128
-pub fn KT128(comptime output_len: usize) type {
-    return KTGeneric(sha3.TurboShake128, 32, output_len);
+/// Right-encode: encodes a number as bytes with length suffix (no allocation)
+fn rightEncode(x: usize) RightEncoded {
+    var result: RightEncoded = undefined;
+
+    if (x == 0) {
+        result.bytes[0] = 0;
+        result.len = 1;
+        return result;
+    }
+
+    var temp: [9]u8 = undefined;
+    var len: usize = 0;
+    var val = x;
+
+    while (val > 0) : (val /= 256) {
+        temp[len] = @intCast(val % 256);
+        len += 1;
+    }
+
+    // Reverse bytes (MSB first)
+    for (0..len) |i| {
+        result.bytes[i] = temp[len - 1 - i];
+    }
+    result.bytes[len] = @intCast(len);
+    result.len = @intCast(len + 1);
+
+    return result;
 }
 
-/// KT256 (KangarooTwelve) is a tree-hashing mode on top of TurboSHAKE256
-pub fn KT256(comptime output_len: usize) type {
-    return KTGeneric(sha3.TurboShake256, 64, output_len);
-}
+// ============================================================================
+// Multi-slice view for zero-copy processing
+// ============================================================================
 
-pub fn KTGeneric(comptime Shaker: fn (?u7) type, comptime cv_len: comptime_int, comptime output_len: usize) type {
-    return struct {
-        const Self = @This();
+/// Virtual contiguous view over multiple slices (zero-copy)
+const MultiSliceView = struct {
+    slices: [3][]const u8,
+    offsets: [4]usize,
 
-        /// Hash a message with an optional customization string
-        pub fn hash(message: []const u8, customization: ?[]const u8, out: *[output_len]u8) !void {
-            var chunk_buf: [chunk_size]u8 = undefined;
-            var kti = KTInput.init(message, customization orelse "");
-            const total_len = kti.len();
-
-            if (total_len <= chunk_size) {
-                const z = kti.read(&chunk_buf);
-                return Shaker(0x07).hash(z, out, .{});
-            }
-
-            var ts_final = Shaker(0x06).init(.{});
-            // Process first chunk
-            const first_chunk = kti.read(&chunk_buf);
-            ts_final.update(first_chunk);
-            ts_final.update(&[8]u8{ 0x03, 0, 0, 0, 0, 0, 0, 0 });
-
-            // Process remaining chunks
-            var num_blocks: usize = 0; // Count of chunks after the first
-            while (true) {
-                const chunk = kti.read(&chunk_buf);
-                if (chunk.len == 0) break;
-                var cv: [cv_len]u8 = undefined;
-                Shaker(0x0B).hash(chunk, &cv, .{});
-                ts_final.update(&cv);
-                num_blocks += 1;
-            }
-
-            // Encode number of blocks (chunks after the first)
-            var encoded_len_buf: [9]u8 = undefined;
-            const encoded_len = encodeLength(&encoded_len_buf, num_blocks);
-            ts_final.update(encoded_len_buf[0..encoded_len]);
-            ts_final.update(&[2]u8{ 0xff, 0xff });
-            ts_final.final(out);
-        }
-
-        /// Context for parallel chunk processing
-        const ChunkContext = struct {
-            kti: KTInput,
-            end_chunk: usize,
-            start_chunk_idx: usize,
-            results: [][cv_len]u8,
-
-            fn processChunkRange(ctx: *@This()) void {
-                var chunk_buf: [chunk_size]u8 = undefined;
-
-                // Process our assigned chunks starting from the pre-positioned KTInput
-                var current_chunk = ctx.start_chunk_idx;
-                while (current_chunk < ctx.end_chunk) {
-                    const chunk = ctx.kti.read(&chunk_buf);
-                    if (chunk.len == 0) break; // Should not happen in normal operation
-                    Shaker(0x0B).hash(chunk, &ctx.results[current_chunk], .{});
-                    current_chunk += 1;
-                }
-            }
+    fn init(s1: []const u8, s2: []const u8, s3: []const u8) MultiSliceView {
+        return .{
+            .slices = .{ s1, s2, s3 },
+            .offsets = .{
+                0,
+                s1.len,
+                s1.len + s2.len,
+                s1.len + s2.len + s3.len,
+            },
         };
+    }
 
-        /// Hash a message with an optional customization string using parallel chunk processing
-        pub fn hashParallel(message: []const u8, customization: ?[]const u8, out: *[output_len]u8, allocator: std.mem.Allocator) !void {
-            var chunk_buf: [chunk_size]u8 = undefined;
-            var kti = KTInput.init(message, customization orelse "");
-            const total_len = kti.len();
+    fn totalLen(self: *const MultiSliceView) usize {
+        return self.offsets[3];
+    }
 
-            // For small inputs, sequential processing is faster (avoids thread pool overhead)
-            // Threshold based on ReleaseFast benchmark: parallel only beneficial for very large inputs (50MB+)
-            // Set conservative threshold based on comprehensive benchmark results
-            const parallel_threshold = 50 * 1024 * 1024; // 50MB - where parallel starts showing benefits
-            if (total_len <= parallel_threshold) {
-                return hash(message, customization, out);
+    /// Get byte at position (zero-copy)
+    fn getByte(self: *const MultiSliceView, pos: usize) u8 {
+        for (0..3) |i| {
+            if (pos >= self.offsets[i] and pos < self.offsets[i + 1]) {
+                return self.slices[i][pos - self.offsets[i]];
             }
-
-            var ts_final = Shaker(0x06).init(.{});
-            // Process first chunk
-            const first_chunk = kti.read(&chunk_buf);
-            ts_final.update(first_chunk);
-            ts_final.update(&[8]u8{ 0x03, 0, 0, 0, 0, 0, 0, 0 });
-
-            // Calculate remaining chunks directly from remaining bytes
-            const remaining_bytes = kti.remaining();
-            const num_chunks = (remaining_bytes + chunk_size - 1) / chunk_size; // Round up division
-
-            if (num_chunks == 0) {
-                // No additional chunks
-                var encoded_len_buf: [9]u8 = undefined;
-                const encoded_num = encodeLength(&encoded_len_buf, 0);
-                ts_final.update(encoded_len_buf[0..encoded_num]);
-                ts_final.update(&[2]u8{ 0xff, 0xff });
-                ts_final.final(out);
-                return;
-            }
-
-            // Create results array only (no need to copy chunks)
-            const results = try allocator.alloc([cv_len]u8, num_chunks);
-            defer allocator.free(results);
-
-            // Use fixed maximum of 256 threads with stack allocation
-            const max_threads = 256;
-            const num_threads = @min(num_chunks, max_threads);
-            const chunks_per_thread = (num_chunks + num_threads - 1) / num_threads;
-
-            // Create thread contexts on stack (no heap allocation)
-            var contexts: [max_threads]ChunkContext = undefined;
-            var actual_threads: usize = 0;
-
-            // Create contexts with pre-positioned KTInput for each thread
-            // kti is already positioned after the first chunk from line 199
-            for (0..num_threads) |thread_idx| {
-                const start_chunk = thread_idx * chunks_per_thread;
-                const end_chunk = @min(start_chunk + chunks_per_thread, num_chunks);
-
-                // Only initialize contexts that will actually be used
-                if (start_chunk < num_chunks) {
-                    // Create KTInput view positioned at this thread's start chunk
-                    const start_pos = kti.pos + (start_chunk * chunk_size);
-                    var thread_kti = kti;
-                    thread_kti.pos = start_pos;
-
-                    contexts[thread_idx] = .{
-                        .kti = thread_kti,
-                        .end_chunk = end_chunk,
-                        .start_chunk_idx = start_chunk,
-                        .results = results,
-                    };
-                    actual_threads += 1;
-                }
-            }
-
-            // Process chunks in parallel using thread pool
-            var pool: std.Thread.Pool = undefined;
-            pool.init(std.Thread.Pool.Options{ .allocator = allocator, .n_jobs = @intCast(actual_threads) }) catch return;
-            defer pool.deinit();
-
-            var wait_group: std.Thread.WaitGroup = .{};
-            for (0..actual_threads) |thread_idx| {
-                pool.spawnWg(&wait_group, ChunkContext.processChunkRange, .{&contexts[thread_idx]});
-            }
-            wait_group.wait();
-
-            // Combine results in order
-            for (results) |result| {
-                ts_final.update(&result);
-            }
-
-            // Encode number of blocks (chunks after the first)
-            var encoded_len_buf: [9]u8 = undefined;
-            const encoded_len = encodeLength(&encoded_len_buf, num_chunks);
-            ts_final.update(encoded_len_buf[0..encoded_len]);
-            ts_final.update(&[2]u8{ 0xff, 0xff });
-            ts_final.final(out);
         }
+        unreachable;
+    }
+
+    /// Try to get a contiguous slice [start..end) - returns null if spans boundaries
+    fn tryGetSlice(self: *const MultiSliceView, start: usize, end: usize) ?[]const u8 {
+        for (0..3) |i| {
+            if (start >= self.offsets[i] and end <= self.offsets[i + 1]) {
+                const local_start = start - self.offsets[i];
+                const local_end = end - self.offsets[i];
+                return self.slices[i][local_start..local_end];
+            }
+        }
+        return null;
+    }
+
+    /// Copy range [start..end) to buffer (used when slice spans boundaries)
+    fn copyRange(self: *const MultiSliceView, start: usize, end: usize, buffer: []u8) void {
+        var pos: usize = 0;
+        for (start..end) |i| {
+            buffer[pos] = self.getByte(i);
+            pos += 1;
+        }
+    }
+};
+
+// ============================================================================
+// Keccak-p[1600,12] SIMD permutation
+// ============================================================================
+
+/// Apply Keccak-p[1600,12] to N states in parallel - optimized version
+fn keccakP1600timesN(comptime N: usize, states: *[5][5]@Vector(N, u64)) void {
+    @setEvalBranchQuota(10000);
+
+    // Pre-computed rotation offsets for rho-pi step
+    const rho_offsets = comptime blk: {
+        var offsets: [24]u6 = undefined;
+        var px: usize = 1;
+        var py: usize = 0;
+        for (0..24) |t| {
+            const rot_amount = ((t + 1) * (t + 2) / 2) % 64;
+            offsets[t] = @intCast(rot_amount);
+            const temp_x = py;
+            py = (2 * px + 3 * py) % 5;
+            px = temp_x;
+        }
+        break :blk offsets;
     };
-}
 
-const testing = std.testing;
+    inline for (RC) |rc| {
+        // θ (theta) - fully unrolled
+        var C: [5]@Vector(N, u64) = undefined;
+        inline for (0..5) |x| {
+            C[x] = states[x][0] ^ states[x][1] ^ states[x][2] ^ states[x][3] ^ states[x][4];
+        }
 
-test "reader 1" {
-    const input = "Hello, world!";
-    const customization = "Zig";
-    var buf: [32]u8 = undefined;
-    var encoded_len_buf: [9]u8 = undefined;
-    const encoded_len = encodeLength(&encoded_len_buf, customization.len);
-    var kti = KTInput.init(input, customization);
-    const out = kti.read(buf[0..]);
-    try testing.expectEqual(out.len, input.len + customization.len + encoded_len);
-    try testing.expectEqualSlices(u8, out[0..input.len], input);
-    try testing.expectEqualSlices(u8, out[input.len .. input.len + customization.len], customization);
-}
+        var D: [5]@Vector(N, u64) = undefined;
+        // Unrolled computation avoiding modulo operations
+        D[0] = C[4] ^ rol64Vec(N, C[1], 1);
+        D[1] = C[0] ^ rol64Vec(N, C[2], 1);
+        D[2] = C[1] ^ rol64Vec(N, C[3], 1);
+        D[3] = C[2] ^ rol64Vec(N, C[4], 1);
+        D[4] = C[3] ^ rol64Vec(N, C[0], 1);
 
-test "reader 2" {
-    const input = "Hello, world!";
-    const customization = "Zig";
-    var buf: [32]u8 = undefined;
-    var encoded_len_buf: [9]u8 = undefined;
-    const encoded_len = encodeLength(&encoded_len_buf, customization.len);
-    var kti = KTInput.init(input, customization);
-    try testing.expectEqualSlices(u8, kti.read(buf[0..7]), input[0..7]);
-    try testing.expectEqualSlices(u8, kti.read(buf[0..6]), input[7..]);
-    try testing.expectEqualSlices(u8, kti.read(buf[0..3]), customization[0..]);
-    try testing.expectEqualSlices(u8, kti.read(buf[0..]), encoded_len_buf[0..encoded_len]);
-}
+        // Apply D to all lanes - fully unrolled
+        inline for (0..5) |x| {
+            states[x][0] ^= D[x];
+            states[x][1] ^= D[x];
+            states[x][2] ^= D[x];
+            states[x][3] ^= D[x];
+            states[x][4] ^= D[x];
+        }
 
-fn ptn(x: []u8) void {
-    for (x, 0..) |*p, i| {
-        p.* = @truncate(i % 0xfb);
+        // ρ (rho) and π (pi) - optimized with pre-computed offsets
+        var current = states[1][0];
+        var px: usize = 1;
+        var py: usize = 0;
+        inline for (rho_offsets) |rot| {
+            const next_y = (2 * px + 3 * py) % 5;
+            const next = states[py][next_y];
+            states[py][next_y] = rol64Vec(N, current, rot);
+            current = next;
+            px = py;
+            py = next_y;
+        }
+
+        // χ (chi) - optimized with better register usage
+        inline for (0..5) |y| {
+            const t0 = states[0][y];
+            const t1 = states[1][y];
+            const t2 = states[2][y];
+            const t3 = states[3][y];
+            const t4 = states[4][y];
+
+            states[0][y] = t0 ^ (~t1 & t2);
+            states[1][y] = t1 ^ (~t2 & t3);
+            states[2][y] = t2 ^ (~t3 & t4);
+            states[3][y] = t3 ^ (~t4 & t0);
+            states[4][y] = t4 ^ (~t0 & t1);
+        }
+
+        // ι (iota)
+        const rc_splat: @Vector(N, u64) = @splat(rc);
+        states[0][0] ^= rc_splat;
     }
 }
 
-test "KT128 - empty message and customization (32 bytes)" {
-    const KT128_32 = KT128(32);
-    var out: [32]u8 = undefined;
-    try KT128_32.hash("", "", &out);
-    try testing.expectEqualSlices(u8, &out, &[_]u8{
-        0x1A, 0xC2, 0xD4, 0x50, 0xFC, 0x3B, 0x42, 0x05,
-        0xD1, 0x9D, 0xA7, 0xBF, 0xCA, 0x1B, 0x37, 0x51,
-        0x3C, 0x08, 0x03, 0x57, 0x7A, 0xC7, 0x16, 0x7F,
-        0x06, 0xFE, 0x2C, 0xE1, 0xF0, 0xEF, 0x39, 0xE5,
-    });
+/// Add lanes from data to N states in parallel with stride - optimized version
+fn addLanesAll(comptime N: usize, states: *[5][5]@Vector(N, u64), data: []const u8, lane_count: usize, lane_offset: usize) void {
+    std.debug.assert(data.len >= 8 * ((N - 1) * lane_offset + lane_count));
+
+    // Process lanes (at most 25 lanes in Keccak state)
+    inline for (0..25) |xy| {
+        if (xy < lane_count) {
+            const x = xy % 5;
+            const y = xy / 5;
+
+            // Load N lanes with stride - optimized memory access pattern
+            var loaded_data: @Vector(N, u64) = undefined;
+
+            // Manual unroll for common N values
+            if (N == 2) {
+                loaded_data[0] = load64(data[8 * xy ..]);
+                loaded_data[1] = load64(data[8 * (lane_offset + xy) ..]);
+            } else if (N == 4) {
+                loaded_data[0] = load64(data[8 * xy ..]);
+                loaded_data[1] = load64(data[8 * (lane_offset + xy) ..]);
+                loaded_data[2] = load64(data[8 * (2 * lane_offset + xy) ..]);
+                loaded_data[3] = load64(data[8 * (3 * lane_offset + xy) ..]);
+            } else if (N == 8) {
+                inline for (0..8) |i| {
+                    loaded_data[i] = load64(data[8 * (i * lane_offset + xy) ..]);
+                }
+            } else {
+                // Generic fallback
+                inline for (0..N) |i| {
+                    loaded_data[i] = load64(data[8 * (i * lane_offset + xy) ..]);
+                }
+            }
+
+            states[x][y] ^= loaded_data;
+        }
+    }
 }
 
-test "KT128 - empty message and customization (64 bytes)" {
-    const KT128_64 = KT128(64);
-    var out: [64]u8 = undefined;
-    try KT128_64.hash("", "", &out);
-    try testing.expectEqualSlices(u8, &out, &[_]u8{
-        0x1A, 0xC2, 0xD4, 0x50, 0xFC, 0x3B, 0x42, 0x05,
-        0xD1, 0x9D, 0xA7, 0xBF, 0xCA, 0x1B, 0x37, 0x51,
-        0x3C, 0x08, 0x03, 0x57, 0x7A, 0xC7, 0x16, 0x7F,
-        0x06, 0xFE, 0x2C, 0xE1, 0xF0, 0xEF, 0x39, 0xE5,
-        0x42, 0x69, 0xC0, 0x56, 0xB8, 0xC8, 0x2E, 0x48,
-        0x27, 0x60, 0x38, 0xB6, 0xD2, 0x92, 0x96, 0x6C,
-        0xC0, 0x7A, 0x3D, 0x46, 0x45, 0x27, 0x2E, 0x31,
-        0xFF, 0x38, 0x50, 0x81, 0x39, 0xEB, 0x0A, 0x71,
-    });
+// ============================================================================
+// TurboSHAKE with multi-slice support (zero-copy)
+// ============================================================================
+
+/// Apply Keccak-p[1600,12] to a single state
+fn keccakP(state: *[200]u8) void {
+    var lanes: [5][5]u64 = undefined;
+
+    // Load state into lanes
+    for (0..5) |x| {
+        for (0..5) |y| {
+            lanes[x][y] = load64(state[8 * (x + 5 * y) ..]);
+        }
+    }
+
+    // Apply 12 rounds
+    for (RC) |rc| {
+        // θ
+        var C: [5]u64 = undefined;
+        for (0..5) |x| {
+            C[x] = lanes[x][0] ^ lanes[x][1] ^ lanes[x][2] ^ lanes[x][3] ^ lanes[x][4];
+        }
+        var D: [5]u64 = undefined;
+        for (0..5) |x| {
+            D[x] = C[(x + 4) % 5] ^ std.math.rotl(u64, C[(x + 1) % 5], 1);
+        }
+        for (0..5) |x| {
+            for (0..5) |y| {
+                lanes[x][y] ^= D[x];
+            }
+        }
+
+        // ρ and π
+        var current = lanes[1][0];
+        var px: usize = 1;
+        var py: usize = 0;
+        for (0..24) |t| {
+            const temp = lanes[py][(2 * px + 3 * py) % 5];
+            const rot_amount = ((t + 1) * (t + 2) / 2) % 64;
+            lanes[py][(2 * px + 3 * py) % 5] = std.math.rotl(u64, current, @as(u6, @intCast(rot_amount)));
+            current = temp;
+            const temp_x = py;
+            py = (2 * px + 3 * py) % 5;
+            px = temp_x;
+        }
+
+        // χ
+        for (0..5) |y| {
+            const T = [5]u64{ lanes[0][y], lanes[1][y], lanes[2][y], lanes[3][y], lanes[4][y] };
+            for (0..5) |x| {
+                lanes[x][y] = T[x] ^ (~T[(x + 1) % 5] & T[(x + 2) % 5]);
+            }
+        }
+
+        // ι
+        lanes[0][0] ^= rc;
+    }
+
+    // Store lanes back to state
+    for (0..5) |x| {
+        for (0..5) |y| {
+            store64(lanes[x][y], state[8 * (x + 5 * y) ..]);
+        }
+    }
 }
 
-test "KT128 - empty message and customization (10032 bytes)" {
-    const KT128_10032 = KT128(10032);
-    var out: [10032]u8 = undefined;
-    try KT128_10032.hash("", "", &out);
-    try testing.expectEqualSlices(u8, out[10000..], &[_]u8{
-        0xE8, 0xDC, 0x56, 0x36, 0x42, 0xF7, 0x22, 0x8C,
-        0x84, 0x68, 0x4C, 0x89, 0x84, 0x05, 0xD3, 0xA8,
-        0x34, 0x79, 0x91, 0x58, 0xC0, 0x79, 0xB1, 0x28,
-        0x80, 0x27, 0x7A, 0x1D, 0x28, 0xE2, 0xFF, 0x6D,
-    });
+/// Non-allocating TurboSHAKE128: write output to provided buffer
+fn turboSHAKE128MultiSliceToBuffer(view: *const MultiSliceView, separation_byte: u8, output: []u8) void {
+    var state = [_]u8{0} ** 200;
+    const rate: usize = 168;
+    var state_pos: usize = 0;
+
+    // Absorb all bytes from the multi-slice view
+    const total = view.totalLen();
+    var pos: usize = 0;
+    while (pos < total) {
+        state[state_pos] ^= view.getByte(pos);
+        state_pos += 1;
+        pos += 1;
+
+        if (state_pos == rate) {
+            keccakP(&state);
+            state_pos = 0;
+        }
+    }
+
+    // Add separation byte and padding
+    state[state_pos] ^= separation_byte;
+    state[rate - 1] ^= 0x80;
+    keccakP(&state);
+
+    // Squeeze
+    var out_offset: usize = 0;
+    while (out_offset < output.len) {
+        const chunk = @min(rate, output.len - out_offset);
+        @memcpy(output[out_offset..][0..chunk], state[0..chunk]);
+        out_offset += chunk;
+        if (out_offset < output.len) {
+            keccakP(&state);
+        }
+    }
 }
 
-test "KT128 - 1 byte message" {
-    const KT128_32 = KT128(32);
-    var out: [32]u8 = undefined;
-    var msg: [1]u8 = undefined;
-    ptn(&msg);
-    try KT128_32.hash(&msg, "", &out);
-    try testing.expectEqualSlices(u8, &out, &[_]u8{
-        0x2B, 0xDA, 0x92, 0x45, 0x0E, 0x8B, 0x14, 0x7F,
-        0x8A, 0x7C, 0xB6, 0x29, 0xE7, 0x84, 0xA0, 0x58,
-        0xEF, 0xCA, 0x7C, 0xF7, 0xD8, 0x21, 0x8E, 0x02,
-        0xD3, 0x45, 0xDF, 0xAA, 0x65, 0x24, 0x4A, 0x1F,
-    });
+/// Allocating TurboSHAKE128
+fn turboSHAKE128MultiSlice(allocator: std.mem.Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
+    const output = try allocator.alloc(u8, output_len);
+    turboSHAKE128MultiSliceToBuffer(view, separation_byte, output);
+    return output;
 }
 
-test "KT128 - 17 bytes message" {
-    const KT128_32 = KT128(32);
-    var out: [32]u8 = undefined;
-    var msg: [17]u8 = undefined;
-    ptn(&msg);
-    try KT128_32.hash(&msg, "", &out);
-    try testing.expectEqualSlices(u8, &out, &[_]u8{
-        0x6B, 0xF7, 0x5F, 0xA2, 0x23, 0x91, 0x98, 0xDB,
-        0x47, 0x72, 0xE3, 0x64, 0x78, 0xF8, 0xE1, 0x9B,
-        0x0F, 0x37, 0x12, 0x05, 0xF6, 0xA9, 0xA9, 0x3A,
-        0x27, 0x3F, 0x51, 0xDF, 0x37, 0x12, 0x28, 0x88,
-    });
+/// Non-allocating TurboSHAKE256: write output to provided buffer
+fn turboSHAKE256MultiSliceToBuffer(view: *const MultiSliceView, separation_byte: u8, output: []u8) void {
+    var state = [_]u8{0} ** 200;
+    const rate: usize = 136;
+    var state_pos: usize = 0;
+
+    // Absorb all bytes from the multi-slice view
+    const total = view.totalLen();
+    var pos: usize = 0;
+    while (pos < total) {
+        state[state_pos] ^= view.getByte(pos);
+        state_pos += 1;
+        pos += 1;
+
+        if (state_pos == rate) {
+            keccakP(&state);
+            state_pos = 0;
+        }
+    }
+
+    // Add separation byte and padding
+    state[state_pos] ^= separation_byte;
+    state[rate - 1] ^= 0x80;
+    keccakP(&state);
+
+    // Squeeze
+    var out_offset: usize = 0;
+    while (out_offset < output.len) {
+        const chunk = @min(rate, output.len - out_offset);
+        @memcpy(output[out_offset..][0..chunk], state[0..chunk]);
+        out_offset += chunk;
+        if (out_offset < output.len) {
+            keccakP(&state);
+        }
+    }
 }
 
-test "KT128 - 289 bytes message" {
-    const KT128_32 = KT128(32);
-    var msg: [289]u8 = undefined;
-    ptn(&msg);
-    var out: [32]u8 = undefined;
-    try KT128_32.hash(&msg, "", &out);
-    try testing.expectEqualSlices(u8, &out, &[_]u8{
-        0x0C, 0x31, 0x5E, 0xBC, 0xDE, 0xDB, 0xF6, 0x14,
-        0x26, 0xDE, 0x7D, 0xCF, 0x8F, 0xB7, 0x25, 0xD1,
-        0xE7, 0x46, 0x75, 0xD7, 0xF5, 0x32, 0x7A, 0x50,
-        0x67, 0xF3, 0x67, 0xB1, 0x08, 0xEC, 0xB6, 0x7C,
-    });
+/// Allocating TurboSHAKE256
+fn turboSHAKE256MultiSlice(allocator: std.mem.Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
+    const output = try allocator.alloc(u8, output_len);
+    turboSHAKE256MultiSliceToBuffer(view, separation_byte, output);
+    return output;
 }
 
-test "KT128 - 4913 bytes message" {
-    const KT128_32 = KT128(32);
-    var msg: [4913]u8 = undefined;
-    ptn(&msg);
-    var out: [32]u8 = undefined;
-    try KT128_32.hash(&msg, "", &out);
-    try testing.expectEqualSlices(u8, &out, &[_]u8{
-        0xCB, 0x55, 0x2E, 0x2E, 0xC7, 0x7D, 0x99, 0x10,
-        0x70, 0x1D, 0x57, 0x8B, 0x45, 0x7D, 0xDF, 0x77,
-        0x2C, 0x12, 0xE3, 0x22, 0xE4, 0xEE, 0x7F, 0xE4,
-        0x17, 0xF9, 0x2C, 0x75, 0x8F, 0x0D, 0x59, 0xD0,
-    });
+// ============================================================================
+// Streaming TurboSHAKE state structures for incremental absorption
+// ============================================================================
+
+/// Streaming TurboSHAKE128 state for incremental hashing (no allocations)
+pub const TurboSHAKE128State = struct {
+    state: [200]u8,
+    state_pos: usize,
+    const rate: usize = 168;
+
+    /// Initialize a new TurboSHAKE128 state
+    pub fn init() TurboSHAKE128State {
+        return .{
+            .state = [_]u8{0} ** 200,
+            .state_pos = 0,
+        };
+    }
+
+    /// Absorb data incrementally (can be called multiple times)
+    pub fn update(self: *TurboSHAKE128State, data: []const u8) void {
+        for (data) |byte| {
+            self.state[self.state_pos] ^= byte;
+            self.state_pos += 1;
+
+            if (self.state_pos == rate) {
+                keccakP(&self.state);
+                self.state_pos = 0;
+            }
+        }
+    }
+
+    /// Finalize and squeeze output (consumes the state)
+    pub fn finalize(self: *TurboSHAKE128State, separation_byte: u8, output: []u8) void {
+        // Add separation byte and padding
+        self.state[self.state_pos] ^= separation_byte;
+        self.state[rate - 1] ^= 0x80;
+        keccakP(&self.state);
+
+        // Squeeze
+        var out_offset: usize = 0;
+        while (out_offset < output.len) {
+            const chunk = @min(rate, output.len - out_offset);
+            @memcpy(output[out_offset..][0..chunk], self.state[0..chunk]);
+            out_offset += chunk;
+            if (out_offset < output.len) {
+                keccakP(&self.state);
+            }
+        }
+    }
+};
+
+/// Streaming TurboSHAKE256 state for incremental hashing (no allocations)
+pub const TurboSHAKE256State = struct {
+    state: [200]u8,
+    state_pos: usize,
+    const rate: usize = 136;
+
+    /// Initialize a new TurboSHAKE256 state
+    pub fn init() TurboSHAKE256State {
+        return .{
+            .state = [_]u8{0} ** 200,
+            .state_pos = 0,
+        };
+    }
+
+    /// Absorb data incrementally (can be called multiple times)
+    pub fn update(self: *TurboSHAKE256State, data: []const u8) void {
+        for (data) |byte| {
+            self.state[self.state_pos] ^= byte;
+            self.state_pos += 1;
+
+            if (self.state_pos == rate) {
+                keccakP(&self.state);
+                self.state_pos = 0;
+            }
+        }
+    }
+
+    /// Finalize and squeeze output (consumes the state)
+    pub fn finalize(self: *TurboSHAKE256State, separation_byte: u8, output: []u8) void {
+        // Add separation byte and padding
+        self.state[self.state_pos] ^= separation_byte;
+        self.state[rate - 1] ^= 0x80;
+        keccakP(&self.state);
+
+        // Squeeze
+        var out_offset: usize = 0;
+        while (out_offset < output.len) {
+            const chunk = @min(rate, output.len - out_offset);
+            @memcpy(output[out_offset..][0..chunk], self.state[0..chunk]);
+            out_offset += chunk;
+            if (out_offset < output.len) {
+                keccakP(&self.state);
+            }
+        }
+    }
+};
+
+// ============================================================================
+// SIMD leaf processing
+// ============================================================================
+
+/// Process N leaves (8KiB chunks) in parallel for KT128 (stack-allocated result)
+fn processLeavesKT128(comptime N: usize, data: []const u8, result: *[N * 32]u8) void {
+    std.debug.assert(data.len >= N * B);
+
+    const rate_in_lanes: usize = 21;
+    const rate_in_bytes: usize = rate_in_lanes * 8;
+
+    // Initialize N all-zero states with cache alignment
+    var states: [5][5]@Vector(N, u64) align(CACHE_LINE_SIZE) = undefined;
+    inline for (0..5) |x| {
+        inline for (0..5) |y| {
+            states[x][y] = @splat(0);
+        }
+    }
+
+    // Process complete blocks
+    var j: usize = 0;
+    while (j + rate_in_bytes <= B) : (j += rate_in_bytes) {
+        addLanesAll(N, &states, data[j..], rate_in_lanes, B / 8);
+        keccakP1600timesN(N, &states);
+    }
+
+    // Process last incomplete block
+    const remaining_lanes = (B - j) / 8;
+    if (remaining_lanes > 0) {
+        addLanesAll(N, &states, data[j..], remaining_lanes, B / 8);
+    }
+
+    // Add suffix 0x0B and padding
+    const suffix_splat: @Vector(N, u64) = @splat(0x0B);
+    states[1][3] ^= suffix_splat;
+    const padding_splat: @Vector(N, u64) = @splat(0x8000000000000000);
+    states[0][4] ^= padding_splat;
+
+    keccakP1600timesN(N, &states);
+
+    // Extract 32 bytes (4 lanes) from each state
+    inline for (0..N) |i| {
+        store64(states[0][0][i], result[i * 32 ..]);
+        store64(states[1][0][i], result[i * 32 + 8 ..]);
+        store64(states[2][0][i], result[i * 32 + 16 ..]);
+        store64(states[3][0][i], result[i * 32 + 24 ..]);
+    }
 }
 
-test "KT128 - empty message with 1 byte customization" {
-    const KT128_32 = KT128(32);
-    var out: [32]u8 = undefined;
-    var customization: [1]u8 = undefined;
-    ptn(&customization);
-    try KT128_32.hash("", &customization, &out);
-    try testing.expectEqualSlices(u8, &out, &[_]u8{
-        0xFA, 0xB6, 0x58, 0xDB, 0x63, 0xE9, 0x4A, 0x24,
-        0x61, 0x88, 0xBF, 0x7A, 0xF6, 0x9A, 0x13, 0x30,
-        0x45, 0xF4, 0x6E, 0xE9, 0x84, 0xC5, 0x6E, 0x3C,
-        0x33, 0x28, 0xCA, 0xAF, 0x1A, 0xA1, 0xA5, 0x83,
-    });
+/// Process N leaves (8KiB chunks) in parallel for KT256 (stack-allocated result)
+fn processLeavesKT256(comptime N: usize, data: []const u8, result: *[N * 64]u8) void {
+    std.debug.assert(data.len >= N * B);
+
+    const rate_in_lanes: usize = 17;
+    const rate_in_bytes: usize = rate_in_lanes * 8;
+
+    // Initialize N all-zero states with cache alignment
+    var states: [5][5]@Vector(N, u64) align(CACHE_LINE_SIZE) = undefined;
+    inline for (0..5) |x| {
+        inline for (0..5) |y| {
+            states[x][y] = @splat(0);
+        }
+    }
+
+    // Process complete blocks
+    var j: usize = 0;
+    while (j + rate_in_bytes <= B) : (j += rate_in_bytes) {
+        addLanesAll(N, &states, data[j..], rate_in_lanes, B / 8);
+        keccakP1600timesN(N, &states);
+    }
+
+    // Process last incomplete block
+    const remaining_lanes = (B - j) / 8;
+    if (remaining_lanes > 0) {
+        addLanesAll(N, &states, data[j..], remaining_lanes, B / 8);
+    }
+
+    // Add suffix 0x0B and padding
+    const suffix_splat: @Vector(N, u64) = @splat(0x0B);
+    states[4][0] ^= suffix_splat;
+    const padding_splat: @Vector(N, u64) = @splat(0x8000000000000000);
+    states[1][3] ^= padding_splat;
+
+    keccakP1600timesN(N, &states);
+
+    // Extract 64 bytes (8 lanes) from each state
+    inline for (0..N) |i| {
+        store64(states[0][0][i], result[i * 64 ..]);
+        store64(states[1][0][i], result[i * 64 + 8 ..]);
+        store64(states[2][0][i], result[i * 64 + 16 ..]);
+        store64(states[3][0][i], result[i * 64 + 24 ..]);
+        store64(states[4][0][i], result[i * 64 + 32 ..]);
+        store64(states[0][1][i], result[i * 64 + 40 ..]);
+        store64(states[1][1][i], result[i * 64 + 48 ..]);
+        store64(states[2][1][i], result[i * 64 + 56 ..]);
+    }
 }
 
-test "KT128 - 1 byte message with 41 bytes customization" {
-    const KT128_32 = KT128(32);
-    var msg = [_]u8{0xFF};
-    var out: [32]u8 = undefined;
-    var customization: [41]u8 = undefined;
-    ptn(&customization);
-    try KT128_32.hash(&msg, &customization, &out);
-    try testing.expectEqualSlices(u8, &out, &[_]u8{
-        0xD8, 0x48, 0xC5, 0x06, 0x8C, 0xED, 0x73, 0x6F, 0x44, 0x62, 0x15, 0x9B, 0x98, 0x67, 0xFD, 0x4C, 0x20, 0xB8, 0x08, 0xAC, 0xC3,
-        0xD5, 0xBC, 0x48, 0xE0, 0xB0, 0x6B, 0xA0, 0xA3, 0x76, 0x2E, 0xC4,
-    });
+// ============================================================================
+// Thread-level leaf processing (for large files)
+// ============================================================================
+
+/// Context for processing a batch of leaves in a thread
+const LeafBatchContext = struct {
+    output_cvs: []u8,
+    batch_start: usize,
+    batch_count: usize,
+    kt_variant: enum { kt128, kt256 },
+    view: *const MultiSliceView,
+    scratch_buffer: []u8, // Pre-allocated scratch space (no allocations in worker!)
+    total_len: usize, // Total length of input data (for boundary checking)
+};
+
+/// Process a batch of leaves in a single thread using SIMD (NO ALLOCATIONS!)
+fn processLeafBatch(ctx: LeafBatchContext) void {
+    // Use first part of scratch buffer for leaf data
+    const leaf_buffer = ctx.scratch_buffer[0 .. 8 * B];
+    // Use second part for chaining value output
+    const cv_size: usize = if (ctx.kt_variant == .kt128) 32 else 64;
+    const cv_scratch = ctx.scratch_buffer[8 * B .. 8 * B + cv_size];
+
+    var cvs_offset: usize = 0;
+    var j: usize = ctx.batch_start;
+    const batch_end = @min(ctx.batch_start + ctx.batch_count * B, ctx.total_len);
+
+    // Process leaves using SIMD (8x, 4x, 2x, 1x) based on optimal vector length
+    while (j < batch_end) {
+        const remaining = batch_end - j;
+
+        if (optimal_vector_len >= 8 and remaining >= 8 * B and ctx.kt_variant == .kt128) {
+            // Process 8 leaves in parallel (KT128)
+            if (ctx.view.tryGetSlice(j, j + 8 * B)) |leaf_data| {
+                var leaf_cvs: [8 * 32]u8 = undefined;
+                processLeavesKT128(8, leaf_data, &leaf_cvs);
+                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+            } else {
+                ctx.view.copyRange(j, j + 8 * B, leaf_buffer[0 .. 8 * B]);
+                var leaf_cvs: [8 * 32]u8 = undefined;
+                processLeavesKT128(8, leaf_buffer[0 .. 8 * B], &leaf_cvs);
+                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+            }
+            cvs_offset += 8 * 32;
+            j += 8 * B;
+        } else if (optimal_vector_len >= 8 and remaining >= 8 * B and ctx.kt_variant == .kt256) {
+            // Process 8 leaves in parallel (KT256)
+            if (ctx.view.tryGetSlice(j, j + 8 * B)) |leaf_data| {
+                var leaf_cvs: [8 * 64]u8 = undefined;
+                processLeavesKT256(8, leaf_data, &leaf_cvs);
+                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+            } else {
+                ctx.view.copyRange(j, j + 8 * B, leaf_buffer[0 .. 8 * B]);
+                var leaf_cvs: [8 * 64]u8 = undefined;
+                processLeavesKT256(8, leaf_buffer[0 .. 8 * B], &leaf_cvs);
+                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+            }
+            cvs_offset += 8 * 64;
+            j += 8 * B;
+        } else if (optimal_vector_len >= 4 and remaining >= 4 * B and ctx.kt_variant == .kt128) {
+            // Process 4 leaves in parallel (KT128)
+            if (ctx.view.tryGetSlice(j, j + 4 * B)) |leaf_data| {
+                var leaf_cvs: [4 * 32]u8 = undefined;
+                processLeavesKT128(4, leaf_data, &leaf_cvs);
+                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+            } else {
+                ctx.view.copyRange(j, j + 4 * B, leaf_buffer[0 .. 4 * B]);
+                var leaf_cvs: [4 * 32]u8 = undefined;
+                processLeavesKT128(4, leaf_buffer[0 .. 4 * B], &leaf_cvs);
+                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+            }
+            cvs_offset += 4 * 32;
+            j += 4 * B;
+        } else if (optimal_vector_len >= 4 and remaining >= 4 * B and ctx.kt_variant == .kt256) {
+            // Process 4 leaves in parallel (KT256)
+            if (ctx.view.tryGetSlice(j, j + 4 * B)) |leaf_data| {
+                var leaf_cvs: [4 * 64]u8 = undefined;
+                processLeavesKT256(4, leaf_data, &leaf_cvs);
+                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+            } else {
+                ctx.view.copyRange(j, j + 4 * B, leaf_buffer[0 .. 4 * B]);
+                var leaf_cvs: [4 * 64]u8 = undefined;
+                processLeavesKT256(4, leaf_buffer[0 .. 4 * B], &leaf_cvs);
+                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+            }
+            cvs_offset += 4 * 64;
+            j += 4 * B;
+        } else if (optimal_vector_len >= 2 and remaining >= 2 * B and ctx.kt_variant == .kt128) {
+            // Process 2 leaves in parallel (KT128)
+            if (ctx.view.tryGetSlice(j, j + 2 * B)) |leaf_data| {
+                var leaf_cvs: [2 * 32]u8 = undefined;
+                processLeavesKT128(2, leaf_data, &leaf_cvs);
+                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+            } else {
+                ctx.view.copyRange(j, j + 2 * B, leaf_buffer[0 .. 2 * B]);
+                var leaf_cvs: [2 * 32]u8 = undefined;
+                processLeavesKT128(2, leaf_buffer[0 .. 2 * B], &leaf_cvs);
+                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+            }
+            cvs_offset += 2 * 32;
+            j += 2 * B;
+        } else if (optimal_vector_len >= 2 and remaining >= 2 * B and ctx.kt_variant == .kt256) {
+            // Process 2 leaves in parallel (KT256)
+            if (ctx.view.tryGetSlice(j, j + 2 * B)) |leaf_data| {
+                var leaf_cvs: [2 * 64]u8 = undefined;
+                processLeavesKT256(2, leaf_data, &leaf_cvs);
+                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+            } else {
+                ctx.view.copyRange(j, j + 2 * B, leaf_buffer[0 .. 2 * B]);
+                var leaf_cvs: [2 * 64]u8 = undefined;
+                processLeavesKT256(2, leaf_buffer[0 .. 2 * B], &leaf_cvs);
+                @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
+            }
+            cvs_offset += 2 * 64;
+            j += 2 * B;
+        } else {
+            // Process single leaf (NO ALLOCATION!)
+            const chunk_len = @min(B, batch_end - j);
+            if (ctx.view.tryGetSlice(j, j + chunk_len)) |leaf_data| {
+                const cv_slice = MultiSliceView.init(leaf_data, &[_]u8{}, &[_]u8{});
+                if (ctx.kt_variant == .kt128) {
+                    turboSHAKE128MultiSliceToBuffer(&cv_slice, 0x0B, cv_scratch[0..32]);
+                    @memcpy(ctx.output_cvs[cvs_offset..][0..32], cv_scratch[0..32]);
+                    cvs_offset += 32;
+                } else {
+                    turboSHAKE256MultiSliceToBuffer(&cv_slice, 0x0B, cv_scratch[0..64]);
+                    @memcpy(ctx.output_cvs[cvs_offset..][0..64], cv_scratch[0..64]);
+                    cvs_offset += 64;
+                }
+            } else {
+                ctx.view.copyRange(j, j + chunk_len, leaf_buffer[0..chunk_len]);
+                const cv_slice = MultiSliceView.init(leaf_buffer[0..chunk_len], &[_]u8{}, &[_]u8{});
+                if (ctx.kt_variant == .kt128) {
+                    turboSHAKE128MultiSliceToBuffer(&cv_slice, 0x0B, cv_scratch[0..32]);
+                    @memcpy(ctx.output_cvs[cvs_offset..][0..32], cv_scratch[0..32]);
+                    cvs_offset += 32;
+                } else {
+                    turboSHAKE256MultiSliceToBuffer(&cv_slice, 0x0B, cv_scratch[0..64]);
+                    @memcpy(ctx.output_cvs[cvs_offset..][0..64], cv_scratch[0..64]);
+                    cvs_offset += 64;
+                }
+            }
+            j += B;
+        }
+    }
 }
 
-test "KT128 - 8191 bytes message" {
-    const KT128_32 = KT128(32);
-    var msg: [8191]u8 = undefined;
-    ptn(&msg);
-    var out: [32]u8 = undefined;
-    try KT128_32.hash(&msg, "", &out);
-    try testing.expectEqualSlices(u8, &out, &[_]u8{
-        0x1B, 0x57, 0x76, 0x36, 0xF7, 0x23, 0x64, 0x3E,
-        0x99, 0x0C, 0xC7, 0xD6, 0xA6, 0x59, 0x83, 0x74,
-        0x36, 0xFD, 0x6A, 0x10, 0x36, 0x26, 0x60, 0x0E,
-        0xB8, 0x30, 0x1C, 0xD1, 0xDB, 0xE5, 0x53, 0xD6,
-    });
+// ============================================================================
+// Single-threaded implementation (for small/medium files)
+// ============================================================================
+
+/// Single-threaded KT128 implementation
+fn kt128SingleThreaded(view: *const MultiSliceView, total_len: usize, output: []u8) void {
+    // Tree mode: process leaves using SIMD and absorb CVs incrementally
+
+    // Initialize streaming TurboSHAKE128 state for final node
+    var final_state = TurboSHAKE128State.init();
+
+    // Absorb first B bytes from input
+    var first_b_buffer: [B]u8 = undefined;
+    if (view.tryGetSlice(0, B)) |first_chunk| {
+        final_state.update(first_chunk);
+    } else {
+        view.copyRange(0, B, &first_b_buffer);
+        final_state.update(&first_b_buffer);
+    }
+
+    // Absorb padding bytes (8 bytes: 0x03 followed by 7 zeros)
+    const padding = [_]u8{ 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    final_state.update(&padding);
+
+    var j: usize = B;
+    var n: usize = 0;
+
+    // Temporary buffers for boundary-spanning leaves and CV computation
+    var leaf_buffer: [B * 8]u8 align(CACHE_LINE_SIZE) = undefined;
+    var cv_buffer: [32]u8 = undefined;
+
+    // Process 8 leaves in parallel (if optimal for this platform)
+    while (optimal_vector_len >= 8 and j + 8 * B <= total_len) {
+        if (view.tryGetSlice(j, j + 8 * B)) |leaf_data| {
+            var leaf_cvs: [8 * 32]u8 align(CACHE_LINE_SIZE) = undefined;
+            processLeavesKT128(8, leaf_data, &leaf_cvs);
+            final_state.update(&leaf_cvs); // Absorb all 8 CVs at once
+        } else {
+            view.copyRange(j, j + 8 * B, leaf_buffer[0 .. 8 * B]);
+            var leaf_cvs: [8 * 32]u8 align(CACHE_LINE_SIZE) = undefined;
+            processLeavesKT128(8, leaf_buffer[0 .. 8 * B], &leaf_cvs);
+            final_state.update(&leaf_cvs);
+        }
+        j += 8 * B;
+        n += 8;
+    }
+
+    // Process 4 leaves in parallel (if optimal for this platform)
+    while (optimal_vector_len >= 4 and j + 4 * B <= total_len) {
+        if (view.tryGetSlice(j, j + 4 * B)) |leaf_data| {
+            var leaf_cvs: [4 * 32]u8 align(CACHE_LINE_SIZE) = undefined;
+            processLeavesKT128(4, leaf_data, &leaf_cvs);
+            final_state.update(&leaf_cvs);
+        } else {
+            view.copyRange(j, j + 4 * B, leaf_buffer[0 .. 4 * B]);
+            var leaf_cvs: [4 * 32]u8 align(CACHE_LINE_SIZE) = undefined;
+            processLeavesKT128(4, leaf_buffer[0 .. 4 * B], &leaf_cvs);
+            final_state.update(&leaf_cvs);
+        }
+        j += 4 * B;
+        n += 4;
+    }
+
+    // Process 2 leaves in parallel (if optimal for this platform)
+    while (optimal_vector_len >= 2 and j + 2 * B <= total_len) {
+        if (view.tryGetSlice(j, j + 2 * B)) |leaf_data| {
+            var leaf_cvs: [2 * 32]u8 align(CACHE_LINE_SIZE) = undefined;
+            processLeavesKT128(2, leaf_data, &leaf_cvs);
+            final_state.update(&leaf_cvs);
+        } else {
+            view.copyRange(j, j + 2 * B, leaf_buffer[0 .. 2 * B]);
+            var leaf_cvs: [2 * 32]u8 align(CACHE_LINE_SIZE) = undefined;
+            processLeavesKT128(2, leaf_buffer[0 .. 2 * B], &leaf_cvs);
+            final_state.update(&leaf_cvs);
+        }
+        j += 2 * B;
+        n += 2;
+    }
+
+    // Process remaining leaves one at a time
+    while (j < total_len) {
+        const chunk_len = @min(B, total_len - j);
+        if (view.tryGetSlice(j, j + chunk_len)) |leaf_data| {
+            const cv_slice = MultiSliceView.init(leaf_data, &[_]u8{}, &[_]u8{});
+            turboSHAKE128MultiSliceToBuffer(&cv_slice, 0x0B, cv_buffer[0..32]);
+            final_state.update(cv_buffer[0..32]); // Absorb CV immediately
+        } else {
+            view.copyRange(j, j + chunk_len, leaf_buffer[0..chunk_len]);
+            const cv_slice = MultiSliceView.init(leaf_buffer[0..chunk_len], &[_]u8{}, &[_]u8{});
+            turboSHAKE128MultiSliceToBuffer(&cv_slice, 0x0B, cv_buffer[0..32]);
+            final_state.update(cv_buffer[0..32]);
+        }
+        j += B;
+        n += 1;
+    }
+
+    // Absorb right_encode(n) and terminator
+    const n_enc = rightEncode(n);
+    final_state.update(n_enc.slice());
+    const terminator = [_]u8{ 0xFF, 0xFF };
+    final_state.update(&terminator);
+
+    // Finalize and squeeze output
+    final_state.finalize(0x06, output);
 }
 
-test "KT128 - 8192 bytes message (chunk size)" {
-    const KT128_32 = KT128(32);
-    var msg: [8192]u8 = undefined;
-    ptn(&msg);
-    var out: [32]u8 = undefined;
-    try KT128_32.hash(&msg, "", &out);
-    try testing.expectEqualSlices(u8, &out, &[_]u8{
-        0x48, 0xF2, 0x56, 0xF6, 0x77, 0x2F, 0x9E, 0xDF,
-        0xB6, 0xA8, 0xB6, 0x61, 0xEC, 0x92, 0xDC, 0x93,
-        0xB9, 0x5E, 0xBD, 0x05, 0xA0, 0x8A, 0x17, 0xB3,
-        0x9A, 0xE3, 0x49, 0x08, 0x70, 0xC9, 0x26, 0xC3,
-    });
+/// Single-threaded KT256 implementation
+fn kt256SingleThreaded(view: *const MultiSliceView, total_len: usize, output: []u8) void {
+    // Tree mode: process leaves using SIMD and absorb CVs incrementally
+
+    // Initialize streaming TurboSHAKE256 state for final node
+    var final_state = TurboSHAKE256State.init();
+
+    // Absorb first B bytes from input
+    var first_b_buffer: [B]u8 = undefined;
+    if (view.tryGetSlice(0, B)) |first_chunk| {
+        final_state.update(first_chunk);
+    } else {
+        view.copyRange(0, B, &first_b_buffer);
+        final_state.update(&first_b_buffer);
+    }
+
+    // Absorb padding bytes (8 bytes: 0x03 followed by 7 zeros)
+    const padding = [_]u8{ 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    final_state.update(&padding);
+
+    var j: usize = B;
+    var n: usize = 0;
+
+    // Temporary buffers for boundary-spanning leaves and CV computation
+    var leaf_buffer: [B * 8]u8 align(CACHE_LINE_SIZE) = undefined;
+    var cv_buffer: [64]u8 = undefined;
+
+    // Process 8 leaves in parallel (if optimal for this platform)
+    while (optimal_vector_len >= 8 and j + 8 * B <= total_len) {
+        if (view.tryGetSlice(j, j + 8 * B)) |leaf_data| {
+            var leaf_cvs: [8 * 64]u8 align(CACHE_LINE_SIZE) = undefined;
+            processLeavesKT256(8, leaf_data, &leaf_cvs);
+            final_state.update(&leaf_cvs); // Absorb all 8 CVs at once
+        } else {
+            view.copyRange(j, j + 8 * B, leaf_buffer[0 .. 8 * B]);
+            var leaf_cvs: [8 * 64]u8 align(CACHE_LINE_SIZE) = undefined;
+            processLeavesKT256(8, leaf_buffer[0 .. 8 * B], &leaf_cvs);
+            final_state.update(&leaf_cvs);
+        }
+        j += 8 * B;
+        n += 8;
+    }
+
+    // Process 4 leaves in parallel (if optimal for this platform)
+    while (optimal_vector_len >= 4 and j + 4 * B <= total_len) {
+        if (view.tryGetSlice(j, j + 4 * B)) |leaf_data| {
+            var leaf_cvs: [4 * 64]u8 align(CACHE_LINE_SIZE) = undefined;
+            processLeavesKT256(4, leaf_data, &leaf_cvs);
+            final_state.update(&leaf_cvs);
+        } else {
+            view.copyRange(j, j + 4 * B, leaf_buffer[0 .. 4 * B]);
+            var leaf_cvs: [4 * 64]u8 align(CACHE_LINE_SIZE) = undefined;
+            processLeavesKT256(4, leaf_buffer[0 .. 4 * B], &leaf_cvs);
+            final_state.update(&leaf_cvs);
+        }
+        j += 4 * B;
+        n += 4;
+    }
+
+    // Process 2 leaves in parallel (if optimal for this platform)
+    while (optimal_vector_len >= 2 and j + 2 * B <= total_len) {
+        if (view.tryGetSlice(j, j + 2 * B)) |leaf_data| {
+            var leaf_cvs: [2 * 64]u8 align(CACHE_LINE_SIZE) = undefined;
+            processLeavesKT256(2, leaf_data, &leaf_cvs);
+            final_state.update(&leaf_cvs);
+        } else {
+            view.copyRange(j, j + 2 * B, leaf_buffer[0 .. 2 * B]);
+            var leaf_cvs: [2 * 64]u8 align(CACHE_LINE_SIZE) = undefined;
+            processLeavesKT256(2, leaf_buffer[0 .. 2 * B], &leaf_cvs);
+            final_state.update(&leaf_cvs);
+        }
+        j += 2 * B;
+        n += 2;
+    }
+
+    // Process remaining leaves one at a time
+    while (j < total_len) {
+        const chunk_len = @min(B, total_len - j);
+        if (view.tryGetSlice(j, j + chunk_len)) |leaf_data| {
+            const cv_slice = MultiSliceView.init(leaf_data, &[_]u8{}, &[_]u8{});
+            turboSHAKE256MultiSliceToBuffer(&cv_slice, 0x0B, cv_buffer[0..64]);
+            final_state.update(cv_buffer[0..64]); // Absorb CV immediately
+        } else {
+            view.copyRange(j, j + chunk_len, leaf_buffer[0..chunk_len]);
+            const cv_slice = MultiSliceView.init(leaf_buffer[0..chunk_len], &[_]u8{}, &[_]u8{});
+            turboSHAKE256MultiSliceToBuffer(&cv_slice, 0x0B, cv_buffer[0..64]);
+            final_state.update(cv_buffer[0..64]);
+        }
+        j += B;
+        n += 1;
+    }
+
+    // Absorb right_encode(n) and terminator
+    const n_enc = rightEncode(n);
+    final_state.update(n_enc.slice());
+    const terminator = [_]u8{ 0xFF, 0xFF };
+    final_state.update(&terminator);
+
+    // Finalize and squeeze output
+    final_state.finalize(0x06, output);
 }
 
-// Test parallel vs sequential consistency
-test "KT128 - parallel vs sequential consistency - small message" {
-    const KT128_32 = KT128(32);
-    var msg: [100]u8 = undefined;
-    ptn(&msg);
-    var out_seq: [32]u8 = undefined;
-    var out_par: [32]u8 = undefined;
+// ============================================================================
+// Multi-threaded implementation (for large files ≥ 50 MB)
+// ============================================================================
 
-    try KT128_32.hash(&msg, "", &out_seq);
-    try KT128_32.hashParallel(&msg, "", &out_par, std.testing.allocator);
+/// Multi-threaded KT128 implementation
+fn kt128MultiThreaded(allocator: std.mem.Allocator, view: *const MultiSliceView, total_len: usize, output_len: usize) ![]u8 {
+    // Calculate total number of leaves
+    const total_leaves: usize = (total_len - 1) / B;
 
-    try testing.expectEqualSlices(u8, &out_seq, &out_par);
+    // Allocate buffer for all chaining values
+    const cvs = try allocator.alloc(u8, total_leaves * 32);
+    defer allocator.free(cvs);
+
+    // Initialize thread pool
+    var pool: Pool = undefined;
+    try pool.init(.{ .allocator = allocator });
+    defer pool.deinit();
+
+    const thread_count = pool.threads.len;
+    if (thread_count == 0) {
+        // Single-threaded fallback
+        const output = try allocator.alloc(u8, output_len);
+        kt128SingleThreaded(view, total_len, output);
+        return output;
+    }
+
+    // Divide work among threads
+    const leaves_per_thread = (total_leaves + thread_count - 1) / thread_count;
+
+    // Pre-allocate scratch buffers for all threads (8 leaves + 32 bytes for CV)
+    const scratch_size = 8 * B + 32;
+    const all_scratch = try allocator.alloc(u8, thread_count * scratch_size);
+    defer allocator.free(all_scratch);
+
+    var wait_group: WaitGroup = .{};
+    var leaves_assigned: usize = 0;
+    var thread_idx: usize = 0;
+
+    while (leaves_assigned < total_leaves) {
+        const batch_count = @min(leaves_per_thread, total_leaves - leaves_assigned);
+        const batch_start = B + leaves_assigned * B;
+        const cvs_offset = leaves_assigned * 32;
+
+        const ctx = LeafBatchContext{
+            .output_cvs = cvs[cvs_offset .. cvs_offset + batch_count * 32],
+            .batch_start = batch_start,
+            .batch_count = batch_count,
+            .kt_variant = .kt128,
+            .view = view,
+            .scratch_buffer = all_scratch[thread_idx * scratch_size .. (thread_idx + 1) * scratch_size],
+            .total_len = total_len,
+        };
+
+        pool.spawnWg(&wait_group, processLeafBatch, .{ctx});
+
+        leaves_assigned += batch_count;
+        thread_idx += 1;
+    }
+
+    // Wait for all threads to complete
+    pool.waitAndWork(&wait_group);
+
+    // Build final node
+    const n_enc = rightEncode(total_leaves);
+    const final_node_len = B + 8 + total_leaves * 32 + n_enc.len + 2;
+    const final_node = try allocator.alloc(u8, final_node_len);
+    defer allocator.free(final_node);
+
+    // Copy first B bytes
+    if (view.tryGetSlice(0, B)) |first_chunk| {
+        @memcpy(final_node[0..B], first_chunk);
+    } else {
+        view.copyRange(0, B, final_node[0..B]);
+    }
+
+    @memset(final_node[B..][0..8], 0);
+    final_node[B] = 0x03;
+    @memcpy(final_node[B + 8 ..][0 .. total_leaves * 32], cvs);
+    @memcpy(final_node[B + 8 + total_leaves * 32 ..][0..n_enc.len], n_enc.slice());
+    final_node[final_node_len - 2] = 0xFF;
+    final_node[final_node_len - 1] = 0xFF;
+
+    const final_view = MultiSliceView.init(final_node, &[_]u8{}, &[_]u8{});
+    return turboSHAKE128MultiSlice(allocator, &final_view, 0x06, output_len);
 }
 
-test "KT128 - parallel vs sequential consistency - multi-chunk message" {
-    const KT128_32 = KT128(32);
-    var msg: [20000]u8 = undefined;
-    ptn(&msg);
-    var out_seq: [32]u8 = undefined;
-    var out_par: [32]u8 = undefined;
+/// Multi-threaded KT256 implementation
+fn kt256MultiThreaded(allocator: std.mem.Allocator, view: *const MultiSliceView, total_len: usize, output_len: usize) ![]u8 {
+    const total_leaves: usize = (total_len - 1) / B;
 
-    try KT128_32.hash(&msg, "", &out_seq);
-    try KT128_32.hashParallel(&msg, "", &out_par, std.testing.allocator);
+    const cvs = try allocator.alloc(u8, total_leaves * 64);
+    defer allocator.free(cvs);
 
-    try testing.expectEqualSlices(u8, &out_seq, &out_par);
+    var pool: Pool = undefined;
+    try pool.init(.{ .allocator = allocator });
+    defer pool.deinit();
+
+    const thread_count = pool.threads.len;
+    if (thread_count == 0) {
+        const output = try allocator.alloc(u8, output_len);
+        kt256SingleThreaded(view, total_len, output);
+        return output;
+    }
+
+    const leaves_per_thread = (total_leaves + thread_count - 1) / thread_count;
+
+    // Pre-allocate scratch buffers for all threads (8 leaves + 64 bytes for CV)
+    const scratch_size = 8 * B + 64;
+    const all_scratch = try allocator.alloc(u8, thread_count * scratch_size);
+    defer allocator.free(all_scratch);
+
+    var wait_group: WaitGroup = .{};
+    var leaves_assigned: usize = 0;
+    var thread_idx: usize = 0;
+
+    while (leaves_assigned < total_leaves) {
+        const batch_count = @min(leaves_per_thread, total_leaves - leaves_assigned);
+        const batch_start = B + leaves_assigned * B;
+        const cvs_offset = leaves_assigned * 64;
+
+        const ctx = LeafBatchContext{
+            .output_cvs = cvs[cvs_offset .. cvs_offset + batch_count * 64],
+            .batch_start = batch_start,
+            .batch_count = batch_count,
+            .kt_variant = .kt256,
+            .view = view,
+            .scratch_buffer = all_scratch[thread_idx * scratch_size .. (thread_idx + 1) * scratch_size],
+            .total_len = total_len,
+        };
+
+        pool.spawnWg(&wait_group, processLeafBatch, .{ctx});
+
+        leaves_assigned += batch_count;
+        thread_idx += 1;
+    }
+
+    pool.waitAndWork(&wait_group);
+
+    const n_enc = rightEncode(total_leaves);
+    const final_node_len = B + 8 + total_leaves * 64 + n_enc.len + 2;
+    const final_node = try allocator.alloc(u8, final_node_len);
+    defer allocator.free(final_node);
+
+    if (view.tryGetSlice(0, B)) |first_chunk| {
+        @memcpy(final_node[0..B], first_chunk);
+    } else {
+        view.copyRange(0, B, final_node[0..B]);
+    }
+
+    @memset(final_node[B..][0..8], 0);
+    final_node[B] = 0x03;
+    @memcpy(final_node[B + 8 ..][0 .. total_leaves * 64], cvs);
+    @memcpy(final_node[B + 8 + total_leaves * 64 ..][0..n_enc.len], n_enc.slice());
+    final_node[final_node_len - 2] = 0xFF;
+    final_node[final_node_len - 1] = 0xFF;
+
+    const final_view = MultiSliceView.init(final_node, &[_]u8{}, &[_]u8{});
+    return turboSHAKE256MultiSlice(allocator, &final_view, 0x06, output_len);
 }
 
-test "KT128 - parallel vs sequential consistency - with customization" {
-    const KT128_32 = KT128(32);
-    var msg: [25000]u8 = undefined;
-    var customization: [50]u8 = undefined;
-    ptn(&msg);
-    ptn(&customization);
-    var out_seq: [32]u8 = undefined;
-    var out_par: [32]u8 = undefined;
+// ============================================================================
+// Main public API
+// ============================================================================
 
-    try KT128_32.hash(&msg, &customization, &out_seq);
-    try KT128_32.hashParallel(&msg, &customization, &out_par, std.testing.allocator);
+/// KangarooTwelve with 128-bit security (KT128)
+pub const KT128 = struct {
+    /// Single-threaded hash computation
+    /// Writes output to provided buffer (no allocation)
+    pub fn hash(message: []const u8, customization: ?[]const u8, out: []u8) !void {
+        const custom = customization orelse &[_]u8{};
 
-    try testing.expectEqualSlices(u8, &out_seq, &out_par);
-}
+        // Right-encode customization length (stack-allocated, no heap!)
+        const custom_len_enc = rightEncode(custom.len);
 
-test "KT128 - parallel vs sequential consistency - exact chunk boundaries" {
-    const KT128_32 = KT128(32);
+        // Create zero-copy multi-slice view (no concatenation!)
+        const view = MultiSliceView.init(message, custom, custom_len_enc.slice());
+        const total_len = view.totalLen();
 
-    // Test exactly 2 chunks
-    var msg2: [16384]u8 = undefined;
-    ptn(&msg2);
-    var out_seq2: [32]u8 = undefined;
-    var out_par2: [32]u8 = undefined;
+        // Single chunk case - zero-copy absorption!
+        if (total_len <= B) {
+            turboSHAKE128MultiSliceToBuffer(&view, 0x07, out);
+            return;
+        }
 
-    try KT128_32.hash(&msg2, "", &out_seq2);
-    try KT128_32.hashParallel(&msg2, "", &out_par2, std.testing.allocator);
+        // Tree mode - single-threaded SIMD processing
+        kt128SingleThreaded(&view, total_len, out);
+    }
 
-    try testing.expectEqualSlices(u8, &out_seq2, &out_par2);
+    /// Multi-threaded hash computation for large inputs
+    /// Writes output to provided buffer (requires allocator for internal work)
+    pub fn hashParallel(message: []const u8, customization: ?[]const u8, out: []u8, allocator: std.mem.Allocator) !void {
+        const custom = customization orelse &[_]u8{};
 
-    // Test exactly 3 chunks
-    var msg3: [24576]u8 = undefined;
-    ptn(&msg3);
-    var out_seq3: [32]u8 = undefined;
-    var out_par3: [32]u8 = undefined;
+        const custom_len_enc = rightEncode(custom.len);
+        const view = MultiSliceView.init(message, custom, custom_len_enc.slice());
+        const total_len = view.totalLen();
 
-    try KT128_32.hash(&msg3, "", &out_seq3);
-    try KT128_32.hashParallel(&msg3, "", &out_par3, std.testing.allocator);
+        // Single chunk case
+        if (total_len <= B) {
+            turboSHAKE128MultiSliceToBuffer(&view, 0x07, out);
+            return;
+        }
 
-    try testing.expectEqualSlices(u8, &out_seq3, &out_par3);
-}
+        // Tree mode - multi-threaded processing
+        const result = try kt128MultiThreaded(allocator, &view, total_len, out.len);
+        defer allocator.free(result);
+        @memcpy(out, result);
+    }
+};
 
-test "KT128 - parallel produces same results as existing tests" {
-    const KT128_32 = KT128(32);
+/// KangarooTwelve with 256-bit security (KT256)
+pub const KT256 = struct {
+    /// Single-threaded hash computation
+    /// Writes output to provided buffer (no allocation)
+    pub fn hash(message: []const u8, customization: ?[]const u8, out: []u8) !void {
+        const custom = customization orelse &[_]u8{};
 
-    // Test empty message
-    var out_empty: [32]u8 = undefined;
-    try KT128_32.hashParallel("", "", &out_empty, std.testing.allocator);
-    try testing.expectEqualSlices(u8, &out_empty, &[_]u8{
-        0x1A, 0xC2, 0xD4, 0x50, 0xFC, 0x3B, 0x42, 0x05,
-        0xD1, 0x9D, 0xA7, 0xBF, 0xCA, 0x1B, 0x37, 0x51,
-        0x3C, 0x08, 0x03, 0x57, 0x7A, 0xC7, 0x16, 0x7F,
-        0x06, 0xFE, 0x2C, 0xE1, 0xF0, 0xEF, 0x39, 0xE5,
-    });
+        const custom_len_enc = rightEncode(custom.len);
+        const view = MultiSliceView.init(message, custom, custom_len_enc.slice());
+        const total_len = view.totalLen();
 
-    // Test 8192 bytes message
-    var msg: [8192]u8 = undefined;
-    ptn(&msg);
-    var out_8192: [32]u8 = undefined;
-    try KT128_32.hashParallel(&msg, "", &out_8192, std.testing.allocator);
-    try testing.expectEqualSlices(u8, &out_8192, &[_]u8{
-        0x48, 0xF2, 0x56, 0xF6, 0x77, 0x2F, 0x9E, 0xDF,
-        0xB6, 0xA8, 0xB6, 0x61, 0xEC, 0x92, 0xDC, 0x93,
-        0xB9, 0x5E, 0xBD, 0x05, 0xA0, 0x8A, 0x17, 0xB3,
-        0x9A, 0xE3, 0x49, 0x08, 0x70, 0xC9, 0x26, 0xC3,
-    });
-}
+        if (total_len <= B) {
+            turboSHAKE256MultiSliceToBuffer(&view, 0x07, out);
+            return;
+        }
+
+        kt256SingleThreaded(&view, total_len, out);
+    }
+
+    /// Multi-threaded hash computation for large inputs
+    /// Writes output to provided buffer (requires allocator for internal work)
+    pub fn hashParallel(message: []const u8, customization: ?[]const u8, out: []u8, allocator: std.mem.Allocator) !void {
+        const custom = customization orelse &[_]u8{};
+
+        const custom_len_enc = rightEncode(custom.len);
+        const view = MultiSliceView.init(message, custom, custom_len_enc.slice());
+        const total_len = view.totalLen();
+
+        if (total_len <= B) {
+            turboSHAKE256MultiSliceToBuffer(&view, 0x07, out);
+            return;
+        }
+
+        const result = try kt256MultiThreaded(allocator, &view, total_len, out.len);
+        defer allocator.free(result);
+        @memcpy(out, result);
+    }
+};

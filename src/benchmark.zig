@@ -3,7 +3,6 @@ const kangarootwelve = @import("kangarootwelve");
 
 // Import the KT128 implementation from the library
 const KT128 = kangarootwelve.KT128;
-const ptn = kangarootwelve.ptn;
 
 const print = std.debug.print;
 
@@ -70,7 +69,6 @@ fn formatBytes(bytes: usize) [32]u8 {
 }
 
 fn runBenchmark(name: []const u8, message: []const u8, allocator: std.mem.Allocator) !BenchmarkResult {
-    const KT128_32 = KT128(32);
     var out_seq: [32]u8 = undefined;
     var out_par: [32]u8 = undefined;
 
@@ -79,14 +77,14 @@ fn runBenchmark(name: []const u8, message: []const u8, allocator: std.mem.Alloca
     // Sequential benchmark
     var timer_seq = Timer.init();
     timer_seq.startTimer();
-    try KT128_32.hash(message, null, &out_seq);
+    try KT128.hash(message, null, &out_seq);
     timer_seq.stopTimer();
     const sequential_time_ms = timer_seq.elapsedMillis();
 
     // Parallel benchmark
     var timer_par = Timer.init();
     timer_par.startTimer();
-    try KT128_32.hashParallel(message, null, &out_par, allocator);
+    try KT128.hashParallel(message, null, &out_par, allocator);
     timer_par.stopTimer();
     const parallel_time_ms = timer_par.elapsedMillis();
 
