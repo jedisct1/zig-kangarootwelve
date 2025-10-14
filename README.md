@@ -38,91 +38,90 @@ exe.root_module.addImport("kangarootwelve", kangarootwelve.module("kangarootwelv
 ```zig
 const std = @import("std");
 const kangarootwelve = @import("kangarootwelve");
-
-// Create a KT128 hasher with 32-byte output
-const KT128_32 = kangarootwelve.KT128(32);
+const KT128 = kangarootwelve.KT128;
 
 var output: [32]u8 = undefined;
 const message = "Hello, KangarooTwelve!";
 
 // Hash with no customization string
-try KT128_32.hash(message, null, &output);
+try KT128.hash(message, null, &output);
 
 // Or with a customization string
-try KT128_32.hash(message, "my-app-v1", &output);
+try KT128.hash(message, "my-app-v1", &output);
 ```
 
 ### Variable Output Length
 
 ```zig
+const KT128 = kangarootwelve.KT128;
+
 // 64-byte output
-const KT128_64 = kangarootwelve.KT128(64);
 var output: [64]u8 = undefined;
-try KT128_64.hash(message, null, &output);
+try KT128.hash(message, null, &output);
 
 // Any output length you need
-const KT128_128 = kangarootwelve.KT128(128);
 var large_output: [128]u8 = undefined;
-try KT128_128.hash(message, null, &large_output);
+try KT128.hash(message, null, &large_output);
 ```
 
 ### Parallel Hashing
 
-For large inputs (>50MB), parallel processing can significantly improve performance:
+For large inputs (>25-50MB depending on CPU count), parallel processing can significantly improve performance:
 
 ```zig
+const KT128 = kangarootwelve.KT128;
 const allocator = std.heap.page_allocator;
 const large_data = try allocator.alloc(u8, 100 * 1024 * 1024); // 100MB
 defer allocator.free(large_data);
 
 var output: [32]u8 = undefined;
-try KT128_32.hashParallel(large_data, null, &output, allocator);
+try KT128.hashParallel(large_data, null, &output, allocator);
 ```
 
-The implementation automatically uses sequential processing for smaller inputs (≤50MB) to avoid thread pool overhead.
+The implementation automatically adjusts the threshold for parallel processing based on CPU count (25MB for 8+ cores, 35MB for 4-7 cores, 50MB for 1-3 cores).
 
 ### Using KT256
 
 ```zig
-const KT256_64 = kangarootwelve.KT256(64);
+const KT256 = kangarootwelve.KT256;
 var output: [64]u8 = undefined;
-try KT256_64.hash(message, null, &output);
+try KT256.hash(message, null, &output);
 ```
 
 ## API
 
-### `KT128(comptime output_len: usize)`
+### `KT128`
 
-Returns a type with the following methods:
+A struct providing KangarooTwelve with 128-bit security based on TurboSHAKE128.
 
-#### `hash(message: []const u8, customization: ?[]const u8, out: *[output_len]u8) !void`
+#### `hash(message: []const u8, customization: ?[]const u8, out: []u8) !void`
 
-Hashes a message using sequential processing.
-
-- `message`: Input data to hash
-- `customization`: Optional customization string (can be `null` or empty)
-- `out`: Output buffer of the specified length
-
-#### `hashParallel(message: []const u8, customization: ?[]const u8, out: *[output_len]u8, allocator: std.mem.Allocator) !void`
-
-Hashes a message with parallel chunk processing. Automatically falls back to sequential processing for inputs ≤50MB.
+Hashes a message using sequential processing with SIMD optimizations.
 
 - `message`: Input data to hash
-- `customization`: Optional customization string (can be `null` or empty)
-- `out`: Output buffer of the specified length
+- `customization`: Optional customization string (can be `null`)
+- `out`: Output buffer of any length
+
+#### `hashParallel(message: []const u8, customization: ?[]const u8, out: []u8, allocator: std.mem.Allocator) !void`
+
+Hashes a message with parallel chunk processing. Automatically uses sequential processing for smaller inputs to avoid thread pool overhead.
+
+- `message`: Input data to hash
+- `customization`: Optional customization string (can be `null`)
+- `out`: Output buffer of any length
 - `allocator`: Memory allocator for thread pool and intermediate buffers
 
-### `KT256(comptime output_len: usize)`
+### `KT256`
 
-Same API as `KT128`, but uses TurboSHAKE256 internally for higher security margin.
+Same API as `KT128`, but uses TurboSHAKE256 internally for 256-bit security.
 
 ## Performance
 
 The implementation includes optimizations for both small and large inputs:
 
 - Small inputs (≤8KB): Single-pass processing with no chunking overhead
-- Medium inputs (8KB-50MB): Sequential chunked processing
-- Large inputs (>50MB): Parallel processing with up to 256 threads
+- Medium inputs (8KB - ~50MB): Sequential chunked processing with SIMD acceleration
+- Large inputs (>~25-50MB): Parallel processing with dynamic thread pool sizing
 
 Benchmark your specific use case with:
 
