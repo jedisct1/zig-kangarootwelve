@@ -46,73 +46,39 @@ const RC = [12]u64{
 // KangarooTwelve variant configuration
 // ============================================================================
 
-/// KangarooTwelve variant (KT128 or KT256)
-const KTVariant = enum {
-    kt128,
-    kt256,
+/// KangarooTwelve with 128-bit security parameters
+const KT128Variant = struct {
+    const rate = 168; // TurboSHAKE128 rate in bytes
+    const rate_in_lanes = 21; // 168 bytes / 8
+    const cv_size = 32; // Chaining value size in bytes
+    const StateType = TurboSHAKE128State;
+    const separation_byte_pos = .{ .x = 1, .y = 3 }; // lane 11 (88 bytes into 168-byte rate)
+    const padding_pos = .{ .x = 0, .y = 4 }; // lane 20 (last lane of 168-byte rate)
 
-    /// TurboSHAKE rate in bytes
-    inline fn rate(comptime self: KTVariant) usize {
-        return switch (self) {
-            .kt128 => 168, // TurboSHAKE128 rate
-            .kt256 => 136, // TurboSHAKE256 rate
-        };
+    inline fn turboSHAKEToBuffer(view: *const MultiSliceView, separation_byte: u8, output: []u8) void {
+        turboSHAKE128MultiSliceToBuffer(view, separation_byte, output);
     }
 
-    /// TurboSHAKE rate in lanes (64-bit words)
-    inline fn rateInLanes(comptime self: KTVariant) usize {
-        return switch (self) {
-            .kt128 => 21, // 168 bytes / 8
-            .kt256 => 17, // 136 bytes / 8
-        };
+    inline fn turboSHAKEMultiSliceAlloc(allocator: std.mem.Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
+        return turboSHAKE128MultiSlice(allocator, view, separation_byte, output_len);
+    }
+};
+
+/// KangarooTwelve with 256-bit security parameters
+const KT256Variant = struct {
+    const rate = 136; // TurboSHAKE256 rate in bytes
+    const rate_in_lanes = 17; // 136 bytes / 8
+    const cv_size = 64; // Chaining value size in bytes
+    const StateType = TurboSHAKE256State;
+    const separation_byte_pos = .{ .x = 4, .y = 0 }; // lane 4 (32 bytes into 136-byte rate)
+    const padding_pos = .{ .x = 1, .y = 3 }; // lane 16 (last lane of 136-byte rate)
+
+    inline fn turboSHAKEToBuffer(view: *const MultiSliceView, separation_byte: u8, output: []u8) void {
+        turboSHAKE256MultiSliceToBuffer(view, separation_byte, output);
     }
 
-    /// Chaining value size in bytes
-    inline fn cvSize(comptime self: KTVariant) usize {
-        return switch (self) {
-            .kt128 => 32,
-            .kt256 => 64,
-        };
-    }
-
-    /// TurboSHAKE state type for streaming operations
-    inline fn StateType(comptime self: KTVariant) type {
-        return switch (self) {
-            .kt128 => TurboSHAKE128State,
-            .kt256 => TurboSHAKE256State,
-        };
-    }
-
-    /// Get the (x, y) position for the separation byte in SIMD leaf processing
-    inline fn separationBytePos(comptime self: KTVariant) struct { x: usize, y: usize } {
-        return switch (self) {
-            .kt128 => .{ .x = 1, .y = 3 }, // lane 11 (88 bytes into 168-byte rate)
-            .kt256 => .{ .x = 4, .y = 0 }, // lane 4 (32 bytes into 136-byte rate)
-        };
-    }
-
-    /// Get the (x, y) position for the padding byte in SIMD leaf processing
-    inline fn paddingPos(comptime self: KTVariant) struct { x: usize, y: usize } {
-        return switch (self) {
-            .kt128 => .{ .x = 0, .y = 4 }, // lane 20 (last lane of 168-byte rate)
-            .kt256 => .{ .x = 1, .y = 3 }, // lane 16 (last lane of 136-byte rate)
-        };
-    }
-
-    /// Call the appropriate TurboSHAKE function to write output to buffer
-    inline fn turboSHAKEToBuffer(comptime self: KTVariant, view: *const MultiSliceView, separation_byte: u8, output: []u8) void {
-        switch (self) {
-            .kt128 => turboSHAKE128MultiSliceToBuffer(view, separation_byte, output),
-            .kt256 => turboSHAKE256MultiSliceToBuffer(view, separation_byte, output),
-        }
-    }
-
-    /// Call the appropriate TurboSHAKE function with allocation
-    inline fn turboSHAKEMultiSliceAlloc(comptime self: KTVariant, allocator: std.mem.Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
-        return switch (self) {
-            .kt128 => turboSHAKE128MultiSlice(allocator, view, separation_byte, output_len),
-            .kt256 => turboSHAKE256MultiSlice(allocator, view, separation_byte, output_len),
-        };
+    inline fn turboSHAKEMultiSliceAlloc(allocator: std.mem.Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
+        return turboSHAKE256MultiSlice(allocator, view, separation_byte, output_len);
     }
 };
 
@@ -550,12 +516,12 @@ pub const TurboSHAKE256State = TurboSHAKEState(136);
 // ============================================================================
 
 /// Process N leaves (8KiB chunks) in parallel - generic version
-fn processLeaves(comptime variant: KTVariant, comptime N: usize, data: []const u8, result: *[N * variant.cvSize()]u8) void {
+fn processLeaves(comptime Variant: type, comptime N: usize, data: []const u8, result: *[N * Variant.cv_size]u8) void {
     std.debug.assert(data.len >= N * B);
 
-    const rate_in_lanes: usize = variant.rateInLanes();
+    const rate_in_lanes: usize = Variant.rate_in_lanes;
     const rate_in_bytes: usize = rate_in_lanes * 8;
-    const cv_size: usize = variant.cvSize();
+    const cv_size: usize = Variant.cv_size;
 
     // Initialize N all-zero states with cache alignment
     var states: [5][5]@Vector(N, u64) align(CACHE_LINE_SIZE) = undefined;
@@ -579,8 +545,8 @@ fn processLeaves(comptime variant: KTVariant, comptime N: usize, data: []const u
     }
 
     // Add suffix 0x0B and padding
-    const suffix_pos = variant.separationBytePos();
-    const padding_pos = variant.paddingPos();
+    const suffix_pos = Variant.separation_byte_pos;
+    const padding_pos = Variant.padding_pos;
 
     const suffix_splat: @Vector(N, u64) = @splat(0x0B);
     states[suffix_pos.x][suffix_pos.y] ^= suffix_splat;
@@ -636,12 +602,12 @@ fn processLeafBatch(ctx: LeafBatchContext) void {
             // Process 8 leaves in parallel (KT128)
             if (ctx.view.tryGetSlice(j, j + 8 * B)) |leaf_data| {
                 var leaf_cvs: [8 * 32]u8 = undefined;
-                processLeaves(.kt128, 8, leaf_data, &leaf_cvs);
+                processLeaves(KT128Variant, 8, leaf_data, &leaf_cvs);
                 @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
             } else {
                 ctx.view.copyRange(j, j + 8 * B, leaf_buffer[0 .. 8 * B]);
                 var leaf_cvs: [8 * 32]u8 = undefined;
-                processLeaves(.kt128, 8, leaf_buffer[0 .. 8 * B], &leaf_cvs);
+                processLeaves(KT128Variant, 8, leaf_buffer[0 .. 8 * B], &leaf_cvs);
                 @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
             }
             cvs_offset += 8 * 32;
@@ -650,12 +616,12 @@ fn processLeafBatch(ctx: LeafBatchContext) void {
             // Process 8 leaves in parallel (KT256)
             if (ctx.view.tryGetSlice(j, j + 8 * B)) |leaf_data| {
                 var leaf_cvs: [8 * 64]u8 = undefined;
-                processLeaves(.kt256, 8, leaf_data, &leaf_cvs);
+                processLeaves(KT256Variant, 8, leaf_data, &leaf_cvs);
                 @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
             } else {
                 ctx.view.copyRange(j, j + 8 * B, leaf_buffer[0 .. 8 * B]);
                 var leaf_cvs: [8 * 64]u8 = undefined;
-                processLeaves(.kt256, 8, leaf_buffer[0 .. 8 * B], &leaf_cvs);
+                processLeaves(KT256Variant, 8, leaf_buffer[0 .. 8 * B], &leaf_cvs);
                 @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
             }
             cvs_offset += 8 * 64;
@@ -664,12 +630,12 @@ fn processLeafBatch(ctx: LeafBatchContext) void {
             // Process 4 leaves in parallel (KT128)
             if (ctx.view.tryGetSlice(j, j + 4 * B)) |leaf_data| {
                 var leaf_cvs: [4 * 32]u8 = undefined;
-                processLeaves(.kt128, 4, leaf_data, &leaf_cvs);
+                processLeaves(KT128Variant, 4, leaf_data, &leaf_cvs);
                 @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
             } else {
                 ctx.view.copyRange(j, j + 4 * B, leaf_buffer[0 .. 4 * B]);
                 var leaf_cvs: [4 * 32]u8 = undefined;
-                processLeaves(.kt128, 4, leaf_buffer[0 .. 4 * B], &leaf_cvs);
+                processLeaves(KT128Variant, 4, leaf_buffer[0 .. 4 * B], &leaf_cvs);
                 @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
             }
             cvs_offset += 4 * 32;
@@ -678,12 +644,12 @@ fn processLeafBatch(ctx: LeafBatchContext) void {
             // Process 4 leaves in parallel (KT256)
             if (ctx.view.tryGetSlice(j, j + 4 * B)) |leaf_data| {
                 var leaf_cvs: [4 * 64]u8 = undefined;
-                processLeaves(.kt256, 4, leaf_data, &leaf_cvs);
+                processLeaves(KT256Variant, 4, leaf_data, &leaf_cvs);
                 @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
             } else {
                 ctx.view.copyRange(j, j + 4 * B, leaf_buffer[0 .. 4 * B]);
                 var leaf_cvs: [4 * 64]u8 = undefined;
-                processLeaves(.kt256, 4, leaf_buffer[0 .. 4 * B], &leaf_cvs);
+                processLeaves(KT256Variant, 4, leaf_buffer[0 .. 4 * B], &leaf_cvs);
                 @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
             }
             cvs_offset += 4 * 64;
@@ -692,12 +658,12 @@ fn processLeafBatch(ctx: LeafBatchContext) void {
             // Process 2 leaves in parallel (KT128)
             if (ctx.view.tryGetSlice(j, j + 2 * B)) |leaf_data| {
                 var leaf_cvs: [2 * 32]u8 = undefined;
-                processLeaves(.kt128, 2, leaf_data, &leaf_cvs);
+                processLeaves(KT128Variant, 2, leaf_data, &leaf_cvs);
                 @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
             } else {
                 ctx.view.copyRange(j, j + 2 * B, leaf_buffer[0 .. 2 * B]);
                 var leaf_cvs: [2 * 32]u8 = undefined;
-                processLeaves(.kt128, 2, leaf_buffer[0 .. 2 * B], &leaf_cvs);
+                processLeaves(KT128Variant, 2, leaf_buffer[0 .. 2 * B], &leaf_cvs);
                 @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
             }
             cvs_offset += 2 * 32;
@@ -706,12 +672,12 @@ fn processLeafBatch(ctx: LeafBatchContext) void {
             // Process 2 leaves in parallel (KT256)
             if (ctx.view.tryGetSlice(j, j + 2 * B)) |leaf_data| {
                 var leaf_cvs: [2 * 64]u8 = undefined;
-                processLeaves(.kt256, 2, leaf_data, &leaf_cvs);
+                processLeaves(KT256Variant, 2, leaf_data, &leaf_cvs);
                 @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
             } else {
                 ctx.view.copyRange(j, j + 2 * B, leaf_buffer[0 .. 2 * B]);
                 var leaf_cvs: [2 * 64]u8 = undefined;
-                processLeaves(.kt256, 2, leaf_buffer[0 .. 2 * B], &leaf_cvs);
+                processLeaves(KT256Variant, 2, leaf_buffer[0 .. 2 * B], &leaf_cvs);
                 @memcpy(ctx.output_cvs[cvs_offset..][0..leaf_cvs.len], &leaf_cvs);
             }
             cvs_offset += 2 * 64;
@@ -753,9 +719,9 @@ fn processLeafBatch(ctx: LeafBatchContext) void {
 // ============================================================================
 
 /// Generic single-threaded implementation
-fn ktSingleThreaded(comptime variant: KTVariant, view: *const MultiSliceView, total_len: usize, output: []u8) void {
-    const cv_size = variant.cvSize();
-    const StateType = variant.StateType();
+fn ktSingleThreaded(comptime Variant: type, view: *const MultiSliceView, total_len: usize, output: []u8) void {
+    const cv_size = Variant.cv_size;
+    const StateType = Variant.StateType;
 
     // Initialize streaming TurboSHAKE state for final node
     var final_state = StateType.init();
@@ -784,12 +750,12 @@ fn ktSingleThreaded(comptime variant: KTVariant, view: *const MultiSliceView, to
     while (optimal_vector_len >= 8 and j + 8 * B <= total_len) {
         if (view.tryGetSlice(j, j + 8 * B)) |leaf_data| {
             var leaf_cvs: [8 * cv_size]u8 align(CACHE_LINE_SIZE) = undefined;
-            processLeaves(variant, 8, leaf_data, &leaf_cvs);
+            processLeaves(Variant, 8, leaf_data, &leaf_cvs);
             final_state.update(&leaf_cvs); // Absorb all 8 CVs at once
         } else {
             view.copyRange(j, j + 8 * B, leaf_buffer[0 .. 8 * B]);
             var leaf_cvs: [8 * cv_size]u8 align(CACHE_LINE_SIZE) = undefined;
-            processLeaves(variant, 8, leaf_buffer[0 .. 8 * B], &leaf_cvs);
+            processLeaves(Variant, 8, leaf_buffer[0 .. 8 * B], &leaf_cvs);
             final_state.update(&leaf_cvs);
         }
         j += 8 * B;
@@ -800,12 +766,12 @@ fn ktSingleThreaded(comptime variant: KTVariant, view: *const MultiSliceView, to
     while (optimal_vector_len >= 4 and j + 4 * B <= total_len) {
         if (view.tryGetSlice(j, j + 4 * B)) |leaf_data| {
             var leaf_cvs: [4 * cv_size]u8 align(CACHE_LINE_SIZE) = undefined;
-            processLeaves(variant, 4, leaf_data, &leaf_cvs);
+            processLeaves(Variant, 4, leaf_data, &leaf_cvs);
             final_state.update(&leaf_cvs);
         } else {
             view.copyRange(j, j + 4 * B, leaf_buffer[0 .. 4 * B]);
             var leaf_cvs: [4 * cv_size]u8 align(CACHE_LINE_SIZE) = undefined;
-            processLeaves(variant, 4, leaf_buffer[0 .. 4 * B], &leaf_cvs);
+            processLeaves(Variant, 4, leaf_buffer[0 .. 4 * B], &leaf_cvs);
             final_state.update(&leaf_cvs);
         }
         j += 4 * B;
@@ -816,12 +782,12 @@ fn ktSingleThreaded(comptime variant: KTVariant, view: *const MultiSliceView, to
     while (optimal_vector_len >= 2 and j + 2 * B <= total_len) {
         if (view.tryGetSlice(j, j + 2 * B)) |leaf_data| {
             var leaf_cvs: [2 * cv_size]u8 align(CACHE_LINE_SIZE) = undefined;
-            processLeaves(variant, 2, leaf_data, &leaf_cvs);
+            processLeaves(Variant, 2, leaf_data, &leaf_cvs);
             final_state.update(&leaf_cvs);
         } else {
             view.copyRange(j, j + 2 * B, leaf_buffer[0 .. 2 * B]);
             var leaf_cvs: [2 * cv_size]u8 align(CACHE_LINE_SIZE) = undefined;
-            processLeaves(variant, 2, leaf_buffer[0 .. 2 * B], &leaf_cvs);
+            processLeaves(Variant, 2, leaf_buffer[0 .. 2 * B], &leaf_cvs);
             final_state.update(&leaf_cvs);
         }
         j += 2 * B;
@@ -833,12 +799,12 @@ fn ktSingleThreaded(comptime variant: KTVariant, view: *const MultiSliceView, to
         const chunk_len = @min(B, total_len - j);
         if (view.tryGetSlice(j, j + chunk_len)) |leaf_data| {
             const cv_slice = MultiSliceView.init(leaf_data, &[_]u8{}, &[_]u8{});
-            variant.turboSHAKEToBuffer(&cv_slice, 0x0B, cv_buffer[0..cv_size]);
+            Variant.turboSHAKEToBuffer(&cv_slice, 0x0B, cv_buffer[0..cv_size]);
             final_state.update(cv_buffer[0..cv_size]); // Absorb CV immediately
         } else {
             view.copyRange(j, j + chunk_len, leaf_buffer[0..chunk_len]);
             const cv_slice = MultiSliceView.init(leaf_buffer[0..chunk_len], &[_]u8{}, &[_]u8{});
-            variant.turboSHAKEToBuffer(&cv_slice, 0x0B, cv_buffer[0..cv_size]);
+            Variant.turboSHAKEToBuffer(&cv_slice, 0x0B, cv_buffer[0..cv_size]);
             final_state.update(cv_buffer[0..cv_size]);
         }
         j += B;
@@ -860,8 +826,8 @@ fn ktSingleThreaded(comptime variant: KTVariant, view: *const MultiSliceView, to
 // ============================================================================
 
 /// Generic multi-threaded implementation
-fn ktMultiThreaded(comptime variant: KTVariant, allocator: std.mem.Allocator, view: *const MultiSliceView, total_len: usize, output_len: usize) ![]u8 {
-    const cv_size = variant.cvSize();
+fn ktMultiThreaded(comptime Variant: type, allocator: std.mem.Allocator, view: *const MultiSliceView, total_len: usize, output_len: usize) ![]u8 {
+    const cv_size = Variant.cv_size;
 
     // Calculate total number of leaves
     const total_leaves: usize = (total_len - 1) / B;
@@ -879,7 +845,7 @@ fn ktMultiThreaded(comptime variant: KTVariant, allocator: std.mem.Allocator, vi
     if (thread_count == 0) {
         // Single-threaded fallback
         const output = try allocator.alloc(u8, output_len);
-        ktSingleThreaded(variant, view, total_len, output);
+        ktSingleThreaded(Variant, view, total_len, output);
         return output;
     }
 
@@ -904,10 +870,7 @@ fn ktMultiThreaded(comptime variant: KTVariant, allocator: std.mem.Allocator, vi
             .output_cvs = cvs[cvs_offset .. cvs_offset + batch_count * cv_size],
             .batch_start = batch_start,
             .batch_count = batch_count,
-            .kt_variant = switch (variant) {
-                .kt128 => .kt128,
-                .kt256 => .kt256,
-            },
+            .kt_variant = if (Variant == KT128Variant) .kt128 else .kt256,
             .view = view,
             .scratch_buffer = all_scratch[thread_idx * scratch_size .. (thread_idx + 1) * scratch_size],
             .total_len = total_len,
@@ -943,7 +906,7 @@ fn ktMultiThreaded(comptime variant: KTVariant, allocator: std.mem.Allocator, vi
     final_node[final_node_len - 1] = 0xFF;
 
     const final_view = MultiSliceView.init(final_node, &[_]u8{}, &[_]u8{});
-    return variant.turboSHAKEMultiSliceAlloc(allocator, &final_view, 0x06, output_len);
+    return Variant.turboSHAKEMultiSliceAlloc(allocator, &final_view, 0x06, output_len);
 }
 
 // ============================================================================
@@ -971,7 +934,7 @@ pub const KT128 = struct {
         }
 
         // Tree mode - single-threaded SIMD processing
-        ktSingleThreaded(.kt128, &view, total_len, out);
+        ktSingleThreaded(KT128Variant, &view, total_len, out);
     }
 
     /// Multi-threaded hash computation for large inputs
@@ -990,7 +953,7 @@ pub const KT128 = struct {
         }
 
         // Tree mode - multi-threaded processing
-        const result = try ktMultiThreaded(.kt128, allocator, &view, total_len, out.len);
+        const result = try ktMultiThreaded(KT128Variant, allocator, &view, total_len, out.len);
         defer allocator.free(result);
         @memcpy(out, result);
     }
@@ -1012,7 +975,7 @@ pub const KT256 = struct {
             return;
         }
 
-        ktSingleThreaded(.kt256, &view, total_len, out);
+        ktSingleThreaded(KT256Variant, &view, total_len, out);
     }
 
     /// Multi-threaded hash computation for large inputs
@@ -1029,7 +992,7 @@ pub const KT256 = struct {
             return;
         }
 
-        const result = try ktMultiThreaded(.kt256, allocator, &view, total_len, out.len);
+        const result = try ktMultiThreaded(KT256Variant, allocator, &view, total_len, out.len);
         defer allocator.free(result);
         @memcpy(out, result);
     }
