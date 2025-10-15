@@ -323,10 +323,6 @@ fn addLanesAll(comptime N: usize, states: *[5][5]@Vector(N, u64), data: []const 
     }
 }
 
-// ============================================================================
-// TurboSHAKE with multi-slice support (zero-copy)
-// ============================================================================
-
 /// Apply Keccak-p[1600,12] to a single state (byte representation)
 fn keccakP(state: *[200]u8) void {
     @setEvalBranchQuota(10000);
@@ -1018,12 +1014,31 @@ fn KTHash(
     };
 }
 
-/// KangarooTwelve with 128-bit security (based on TurboSHAKE128).
-/// Provides 128-bit collision and preimage resistance.
+/// KangarooTwelve is a fast, secure cryptographic hash function that uses tree-hashing
+/// on top of TurboSHAKE. It is built on the Keccak permutation, the same primitive
+/// underlying SHA-3, which has undergone over 15 years of intensive cryptanalysis
+/// since the SHA-3 competition (2008-2012) and remains secure.
+///
+/// K12 uses Keccak-p[1600,12] with 12 rounds (half of SHA-3's 24 rounds), providing
+/// 128-bit security strength equivalent to AES-128 and SHAKE128. While this offers
+/// less conservative margin than SHA-3, current cryptanalysis reaches only 6 rounds,
+/// leaving a substantial security margin. This deliberate trade-off delivers
+/// significantly better performance while maintaining strong practical security.
+///
+/// Standardized as RFC 9861 after 8 years of public scrutiny. Supports arbitrary-length
+/// output and optional customization strings for domain separation.
 pub const KT128 = KTHash(KT128Variant, turboSHAKE128MultiSliceToBuffer);
 
-/// KangarooTwelve with 256-bit security (based on TurboSHAKE256).
-/// Provides 256-bit collision and preimage resistance. Use when you need
-/// post-quantum security (NIST level 2) or extra conservative margins.
+/// KangarooTwelve is a fast, secure cryptographic hash function that uses tree-hashing
+/// on top of TurboSHAKE. It is built on the Keccak permutation, the same primitive
+/// underlying SHA-3, which has undergone over 15 years of intensive cryptanalysis
+/// since the SHA-3 competition (2008-2012) and remains secure.
+///
+/// KT256 provides 256-bit security strength and achieves NIST post-quantum security
+/// level 2 when using at least 256-bit outputs. Like KT128, it uses Keccak-p[1600,12]
+/// with 12 rounds, offering a deliberate trade-off between conservative margin and
+/// significantly better performance while maintaining strong practical security.
+///
+/// Use KT256 when you need extra conservative margins.
 /// For most applications, KT128 offers better performance with adequate security.
 pub const KT256 = KTHash(KT256Variant, turboSHAKE256MultiSliceToBuffer);
