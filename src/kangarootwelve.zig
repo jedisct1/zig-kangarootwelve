@@ -96,11 +96,11 @@ const KT256Variant = KangarooVariant(
 );
 
 /// Rotate left for u64 vector
-inline fn rol64Vec(comptime N: usize, v: @Vector(N, u64), comptime n: u6) @Vector(N, u64) {
-    if (n == 0) return v;
-    const left: @Vector(N, u64) = @splat(n);
+inline fn rol64Vec(comptime n: usize, v: @Vector(n, u64), comptime shifts: u6) @Vector(n, u64) {
+    if (shifts == 0) return v;
+    const left: @Vector(n, u64) = @splat(shifts);
     const right_shift: u64 = 64 - @as(u64, n);
-    const right: @Vector(N, u64) = @splat(right_shift);
+    const right: @Vector(n, u64) = @splat(right_shift);
     return (v << left) | (v >> right);
 }
 
@@ -209,7 +209,7 @@ const MultiSliceView = struct {
 };
 
 /// Apply Keccak-p[1600,12] to N states in parallel - optimized version
-fn keccakP1600timesN(comptime N: usize, states: *[5][5]@Vector(N, u64)) void {
+fn keccakP1600timesN(comptime n: usize, states: *[5][5]@Vector(n, u64)) void {
     @setEvalBranchQuota(10000);
 
     // Pre-computed rotation offsets for rho-pi step
@@ -229,18 +229,18 @@ fn keccakP1600timesN(comptime N: usize, states: *[5][5]@Vector(N, u64)) void {
 
     inline for (RC) |rc| {
         // θ (theta) - fully unrolled
-        var C: [5]@Vector(N, u64) = undefined;
+        var C: [5]@Vector(n, u64) = undefined;
         inline for (0..5) |x| {
             C[x] = states[x][0] ^ states[x][1] ^ states[x][2] ^ states[x][3] ^ states[x][4];
         }
 
-        var D: [5]@Vector(N, u64) = undefined;
+        var D: [5]@Vector(n, u64) = undefined;
         // Unrolled computation avoiding modulo operations
-        D[0] = C[4] ^ rol64Vec(N, C[1], 1);
-        D[1] = C[0] ^ rol64Vec(N, C[2], 1);
-        D[2] = C[1] ^ rol64Vec(N, C[3], 1);
-        D[3] = C[2] ^ rol64Vec(N, C[4], 1);
-        D[4] = C[3] ^ rol64Vec(N, C[0], 1);
+        D[0] = C[4] ^ rol64Vec(n, C[1], 1);
+        D[1] = C[0] ^ rol64Vec(n, C[2], 1);
+        D[2] = C[1] ^ rol64Vec(n, C[3], 1);
+        D[3] = C[2] ^ rol64Vec(n, C[4], 1);
+        D[4] = C[3] ^ rol64Vec(n, C[0], 1);
 
         // Apply D to all lanes - fully unrolled
         inline for (0..5) |x| {
@@ -258,7 +258,7 @@ fn keccakP1600timesN(comptime N: usize, states: *[5][5]@Vector(N, u64)) void {
         inline for (rho_offsets) |rot| {
             const next_y = (2 * px + 3 * py) % 5;
             const next = states[py][next_y];
-            states[py][next_y] = rol64Vec(N, current, rot);
+            states[py][next_y] = rol64Vec(n, current, rot);
             current = next;
             px = py;
             py = next_y;
@@ -280,14 +280,14 @@ fn keccakP1600timesN(comptime N: usize, states: *[5][5]@Vector(N, u64)) void {
         }
 
         // ι (iota)
-        const rc_splat: @Vector(N, u64) = @splat(rc);
+        const rc_splat: @Vector(n, u64) = @splat(rc);
         states[0][0] ^= rc_splat;
     }
 }
 
 /// Add lanes from data to N states in parallel with stride - optimized version
-fn addLanesAll(comptime N: usize, states: *[5][5]@Vector(N, u64), data: []const u8, lane_count: usize, lane_offset: usize) void {
-    std.debug.assert(data.len >= 8 * ((N - 1) * lane_offset + lane_count));
+fn addLanesAll(comptime n: usize, states: *[5][5]@Vector(n, u64), data: []const u8, lane_count: usize, lane_offset: usize) void {
+    std.debug.assert(data.len >= 8 * ((n - 1) * lane_offset + lane_count));
 
     // Process lanes (at most 25 lanes in Keccak state)
     inline for (0..25) |xy| {
@@ -296,24 +296,22 @@ fn addLanesAll(comptime N: usize, states: *[5][5]@Vector(N, u64), data: []const 
             const y = xy / 5;
 
             // Load N lanes with stride - optimized memory access pattern
-            var loaded_data: @Vector(N, u64) = undefined;
+            var loaded_data: @Vector(n, u64) = undefined;
 
-            // Manual unroll for common N values
-            if (N == 2) {
+            if (n == 2) {
                 loaded_data[0] = load64(data[8 * xy ..]);
                 loaded_data[1] = load64(data[8 * (lane_offset + xy) ..]);
-            } else if (N == 4) {
+            } else if (n == 4) {
                 loaded_data[0] = load64(data[8 * xy ..]);
                 loaded_data[1] = load64(data[8 * (lane_offset + xy) ..]);
                 loaded_data[2] = load64(data[8 * (2 * lane_offset + xy) ..]);
                 loaded_data[3] = load64(data[8 * (3 * lane_offset + xy) ..]);
-            } else if (N == 8) {
+            } else if (n == 8) {
                 inline for (0..8) |i| {
                     loaded_data[i] = load64(data[8 * (i * lane_offset + xy) ..]);
                 }
             } else {
-                // Generic fallback
-                inline for (0..N) |i| {
+                inline for (0..n) |i| {
                     loaded_data[i] = load64(data[8 * (i * lane_offset + xy) ..]);
                 }
             }
@@ -322,10 +320,6 @@ fn addLanesAll(comptime N: usize, states: *[5][5]@Vector(N, u64), data: []const 
         }
     }
 }
-
-// ============================================================================
-// TurboSHAKE with multi-slice support (zero-copy)
-// ============================================================================
 
 /// Apply Keccak-p[1600,12] to a single state (byte representation)
 fn keccakP(state: *[200]u8) void {
@@ -612,15 +606,15 @@ pub const TurboSHAKE128State = TurboSHAKEState(168);
 pub const TurboSHAKE256State = TurboSHAKEState(136);
 
 /// Process N leaves (8KiB chunks) in parallel - generic version
-fn processLeaves(comptime Variant: type, comptime N: usize, data: []const u8, result: *[N * Variant.cv_size]u8) void {
-    std.debug.assert(data.len >= N * B);
+fn processLeaves(comptime Variant: type, comptime n: usize, data: []const u8, result: *[n * Variant.cv_size]u8) void {
+    std.debug.assert(data.len >= n * B);
 
     const rate_in_lanes: usize = Variant.rate_in_lanes;
     const rate_in_bytes: usize = rate_in_lanes * 8;
     const cv_size: usize = Variant.cv_size;
 
     // Initialize N all-zero states with cache alignment
-    var states: [5][5]@Vector(N, u64) align(CACHE_LINE_SIZE) = undefined;
+    var states: [5][5]@Vector(n, u64) align(CACHE_LINE_SIZE) = undefined;
     inline for (0..5) |x| {
         inline for (0..5) |y| {
             states[x][y] = @splat(0);
@@ -630,26 +624,26 @@ fn processLeaves(comptime Variant: type, comptime N: usize, data: []const u8, re
     // Process complete blocks
     var j: usize = 0;
     while (j + rate_in_bytes <= B) : (j += rate_in_bytes) {
-        addLanesAll(N, &states, data[j..], rate_in_lanes, B / 8);
-        keccakP1600timesN(N, &states);
+        addLanesAll(n, &states, data[j..], rate_in_lanes, B / 8);
+        keccakP1600timesN(n, &states);
     }
 
     // Process last incomplete block
     const remaining_lanes = (B - j) / 8;
     if (remaining_lanes > 0) {
-        addLanesAll(N, &states, data[j..], remaining_lanes, B / 8);
+        addLanesAll(n, &states, data[j..], remaining_lanes, B / 8);
     }
 
     // Add suffix 0x0B and padding
     const suffix_pos = Variant.separation_byte_pos;
     const padding_pos = Variant.padding_pos;
 
-    const suffix_splat: @Vector(N, u64) = @splat(0x0B);
+    const suffix_splat: @Vector(n, u64) = @splat(0x0B);
     states[suffix_pos.x][suffix_pos.y] ^= suffix_splat;
-    const padding_splat: @Vector(N, u64) = @splat(0x8000000000000000);
+    const padding_splat: @Vector(n, u64) = @splat(0x8000000000000000);
     states[padding_pos.x][padding_pos.y] ^= padding_splat;
 
-    keccakP1600timesN(N, &states);
+    keccakP1600timesN(n, &states);
 
     // Extract chaining values from each state
     const lanes_to_extract = cv_size / 8;
@@ -657,7 +651,7 @@ fn processLeaves(comptime Variant: type, comptime N: usize, data: []const u8, re
     inline while (lane_idx < lanes_to_extract) : (lane_idx += 1) {
         const x = lane_idx % 5;
         const y = lane_idx / 5;
-        inline for (0..N) |i| {
+        inline for (0..n) |i| {
             store64(states[x][y][i], result[i * cv_size + lane_idx * 8 ..]);
         }
     }
@@ -677,21 +671,21 @@ const LeafBatchContext = struct {
 /// Helper function to process N leaves in parallel, reducing code duplication
 inline fn processNLeaves(
     comptime Variant: type,
-    comptime N: usize,
+    comptime n: usize,
     view: *const MultiSliceView,
     j: usize,
     leaf_buffer: []u8,
     output: []u8,
 ) void {
     const cv_size = Variant.cv_size;
-    if (view.tryGetSlice(j, j + N * B)) |leaf_data| {
-        var leaf_cvs: [N * cv_size]u8 = undefined;
-        processLeaves(Variant, N, leaf_data, &leaf_cvs);
+    if (view.tryGetSlice(j, j + n * B)) |leaf_data| {
+        var leaf_cvs: [n * cv_size]u8 = undefined;
+        processLeaves(Variant, n, leaf_data, &leaf_cvs);
         @memcpy(output[0..leaf_cvs.len], &leaf_cvs);
     } else {
-        view.copyRange(j, j + N * B, leaf_buffer[0 .. N * B]);
-        var leaf_cvs: [N * cv_size]u8 = undefined;
-        processLeaves(Variant, N, leaf_buffer[0 .. N * B], &leaf_cvs);
+        view.copyRange(j, j + n * B, leaf_buffer[0 .. n * B]);
+        var leaf_cvs: [n * cv_size]u8 = undefined;
+        processLeaves(Variant, n, leaf_buffer[0 .. n * B], &leaf_cvs);
         @memcpy(output[0..leaf_cvs.len], &leaf_cvs);
     }
 }
@@ -975,7 +969,7 @@ fn KTHash(
             // Right-encode customization length (stack-allocated, no heap!)
             const custom_len_enc = rightEncode(custom.len);
 
-            // Create zero-copy multi-slice view (no concatenation!)
+            // Create zero-copy multi-slice view
             const view = MultiSliceView.init(message, custom, custom_len_enc.slice());
             const total_len = view.totalLen();
 
@@ -1019,11 +1013,34 @@ fn KTHash(
 }
 
 /// KangarooTwelve with 128-bit security (based on TurboSHAKE128).
-/// Provides 128-bit collision and preimage resistance.
+///
+/// KangarooTwelve is a fast, secure cryptographic hash function that uses tree-hashing
+/// on top of TurboSHAKE. It is built on the Keccak permutation, the same primitive
+/// underlying SHA-3, which has undergone over 15 years of intensive cryptanalysis
+/// since the SHA-3 competition (2008-2012) and remains secure.
+///
+/// K12 uses Keccak-p[1600,12] with 12 rounds (half of SHA-3's 24 rounds), providing
+/// 128-bit security strength equivalent to AES-128 and SHAKE128. While this offers
+/// less conservative margin than SHA-3, current cryptanalysis reaches only 6 rounds,
+/// leaving a substantial security margin. This deliberate trade-off delivers
+/// significantly better performance while maintaining strong practical security.
+///
+/// Standardized as RFC 9861 after 8 years of public scrutiny. Supports arbitrary-length
+/// output and optional customization strings for domain separation.
 pub const KT128 = KTHash(KT128Variant, turboSHAKE128MultiSliceToBuffer);
 
 /// KangarooTwelve with 256-bit security (based on TurboSHAKE256).
-/// Provides 256-bit collision and preimage resistance. Use when you need
-/// post-quantum security (NIST level 2) or extra conservative margins.
+///
+/// KangarooTwelve is a fast, secure cryptographic hash function that uses tree-hashing
+/// on top of TurboSHAKE. It is built on the Keccak permutation, the same primitive
+/// underlying SHA-3, which has undergone over 15 years of intensive cryptanalysis
+/// since the SHA-3 competition (2008-2012) and remains secure.
+///
+/// KT256 provides 256-bit security strength and achieves NIST post-quantum security
+/// level 2 when using at least 256-bit outputs. Like KT128, it uses Keccak-p[1600,12]
+/// with 12 rounds, offering a deliberate trade-off between conservative margin and
+/// significantly better performance while maintaining strong practical security.
+///
+/// Use KT256 when you need extra conservative margins.
 /// For most applications, KT128 offers better performance with adequate security.
 pub const KT256 = KTHash(KT256Variant, turboSHAKE256MultiSliceToBuffer);
