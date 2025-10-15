@@ -18,11 +18,11 @@ const optimal_vector_len = std.simd.suggestVectorLength(u64) orelse 1;
 fn getLargeFileThreshold() usize {
     const cpu_count = Thread.getCpuCount() catch 1;
     if (cpu_count >= 8) {
-        return 25 * 1024 * 1024; // 25 MB for 8+ cores
+        return 3 * 1024 * 1024; // 3 MB for 8+ cores
     } else if (cpu_count >= 4) {
-        return 35 * 1024 * 1024; // 35 MB for 4-7 cores
+        return 5 * 1024 * 1024; // 5 MB for 4-7 cores
     } else {
-        return 50 * 1024 * 1024; // 50 MB for 1-3 cores
+        return 10 * 1024 * 1024; // 10 MB for 1-3 cores
     }
 }
 
@@ -915,6 +915,13 @@ pub const KT128 = struct {
             return;
         }
 
+        // Use single-threaded processing if below threshold
+        const threshold = getLargeFileThreshold();
+        if (total_len < threshold) {
+            ktSingleThreaded(KT128Variant, &view, total_len, out);
+            return;
+        }
+
         // Tree mode - multi-threaded processing
         const result = try ktMultiThreaded(KT128Variant, allocator, &view, total_len, out.len);
         defer allocator.free(result);
@@ -952,6 +959,13 @@ pub const KT256 = struct {
 
         if (total_len <= B) {
             turboSHAKE256MultiSliceToBuffer(&view, 0x07, out);
+            return;
+        }
+
+        // Use single-threaded processing if below threshold
+        const threshold = getLargeFileThreshold();
+        if (total_len < threshold) {
+            ktSingleThreaded(KT256Variant, &view, total_len, out);
             return;
         }
 
