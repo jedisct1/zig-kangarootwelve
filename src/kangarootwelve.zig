@@ -297,27 +297,9 @@ fn addLanesAll(comptime N: usize, states: *[5][5]@Vector(N, u64), data: []const 
 
             // Load N lanes with stride - optimized memory access pattern
             var loaded_data: @Vector(N, u64) = undefined;
-
-            // Manual unroll for common N values
-            if (N == 2) {
-                loaded_data[0] = load64(data[8 * xy ..]);
-                loaded_data[1] = load64(data[8 * (lane_offset + xy) ..]);
-            } else if (N == 4) {
-                loaded_data[0] = load64(data[8 * xy ..]);
-                loaded_data[1] = load64(data[8 * (lane_offset + xy) ..]);
-                loaded_data[2] = load64(data[8 * (2 * lane_offset + xy) ..]);
-                loaded_data[3] = load64(data[8 * (3 * lane_offset + xy) ..]);
-            } else if (N == 8) {
-                inline for (0..8) |i| {
-                    loaded_data[i] = load64(data[8 * (i * lane_offset + xy) ..]);
-                }
-            } else {
-                // Generic fallback
-                inline for (0..N) |i| {
-                    loaded_data[i] = load64(data[8 * (i * lane_offset + xy) ..]);
-                }
+            inline for (0..N) |i| {
+                loaded_data[i] = load64(data[8 * (i * lane_offset + xy) ..]);
             }
-
             states[x][y] ^= loaded_data;
         }
     }
