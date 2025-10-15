@@ -852,7 +852,7 @@ fn ktSingleThreaded(comptime Variant: type, view: *const MultiSliceView, total_l
 }
 
 /// Generic multi-threaded implementation
-fn ktMultiThreaded(comptime Variant: type, allocator: std.mem.Allocator, view: *const MultiSliceView, total_len: usize, output_len: usize) ![]u8 {
+fn ktMultiThreaded(comptime Variant: type, allocator: std.mem.Allocator, view: *const MultiSliceView, total_len: usize, output: []u8) !void {
     const cv_size = Variant.cv_size;
 
     // Calculate total number of leaves
@@ -870,9 +870,8 @@ fn ktMultiThreaded(comptime Variant: type, allocator: std.mem.Allocator, view: *
     const thread_count = pool.threads.len;
     if (thread_count == 0) {
         // Single-threaded fallback
-        const output = try allocator.alloc(u8, output_len);
         ktSingleThreaded(Variant, view, total_len, output);
-        return output;
+        return;
     }
 
     // Divide work among threads
@@ -932,7 +931,7 @@ fn ktMultiThreaded(comptime Variant: type, allocator: std.mem.Allocator, view: *
     final_node[final_node_len - 1] = 0xFF;
 
     const final_view = MultiSliceView.init(final_node, &[_]u8{}, &[_]u8{});
-    return Variant.turboSHAKEMultiSliceAlloc(allocator, &final_view, 0x06, output_len);
+    Variant.turboSHAKEToBuffer(&final_view, 0x06, output);
 }
 
 /// KangarooTwelve with 128-bit security (based on TurboSHAKE128).
@@ -989,9 +988,7 @@ pub const KT128 = struct {
         }
 
         // Tree mode - multi-threaded processing
-        const result = try ktMultiThreaded(KT128Variant, allocator, &view, total_len, out.len);
-        defer allocator.free(result);
-        @memcpy(out, result);
+        try ktMultiThreaded(KT128Variant, allocator, &view, total_len, out);
     }
 };
 
@@ -1044,8 +1041,6 @@ pub const KT256 = struct {
             return;
         }
 
-        const result = try ktMultiThreaded(KT256Variant, allocator, &view, total_len, out.len);
-        defer allocator.free(result);
-        @memcpy(out, result);
+        try ktMultiThreaded(KT256Variant, allocator, &view, total_len, out);
     }
 };
