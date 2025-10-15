@@ -825,6 +825,136 @@ fn KTHash(
     comptime singleChunkFn: fn (*const MultiSliceView, u8, []u8) void,
 ) type {
     return struct {
+        const Self = @This();
+        const StateType = Variant.StateType;
+
+        // Message buffer (accumulates message data only, not customization)
+        buffer: [chunk_size]u8,
+        buffer_len: usize,
+        message_len: usize,
+
+        // Customization string (fixed at init)
+        customization: []const u8,
+        custom_len_enc: RightEncoded,
+
+        // Tree mode state (lazy initialization when buffer overflows first time)
+        first_chunk: ?[chunk_size]u8, // Saved first chunk for tree mode
+        final_state: ?StateType, // Running TurboSHAKE state for final node
+        num_leaves: usize, // Count of leaves processed (after first chunk)
+
+        /// Initialize a KangarooTwelve hashing context.
+        /// The customization string is optional and used for domain separation.
+        pub fn init(customization: ?[]const u8) Self {
+            const custom = customization orelse &[_]u8{};
+            return .{
+                .buffer = undefined,
+                .buffer_len = 0,
+                .message_len = 0,
+                .customization = custom,
+                .custom_len_enc = rightEncode(custom.len),
+                .first_chunk = null,
+                .final_state = null,
+                .num_leaves = 0,
+            };
+        }
+
+        /// Absorb data into the hash state.
+        /// Can be called multiple times to incrementally add data.
+        pub fn update(self: *Self, data: []const u8) void {
+            if (data.len == 0) return;
+
+            var remaining = data;
+
+            while (remaining.len > 0) {
+                const space_in_buffer = chunk_size - self.buffer_len;
+                const to_copy = @min(space_in_buffer, remaining.len);
+
+                // Copy data into buffer
+                @memcpy(self.buffer[self.buffer_len..][0..to_copy], remaining[0..to_copy]);
+                self.buffer_len += to_copy;
+                self.message_len += to_copy;
+                remaining = remaining[to_copy..];
+
+                // If buffer is full, process it
+                if (self.buffer_len == chunk_size) {
+                    if (self.first_chunk == null) {
+                        // First time buffer fills - initialize tree mode
+                        self.first_chunk = self.buffer;
+                        self.final_state = StateType.init(.{});
+
+                        // Absorb first chunk into final state
+                        self.final_state.?.update(&self.buffer);
+
+                        // Absorb padding (8 bytes: 0x03 followed by 7 zeros)
+                        const padding = [_]u8{ 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+                        self.final_state.?.update(&padding);
+                    } else {
+                        // Subsequent chunks - process as leaf and absorb CV
+                        const cv_size = Variant.cv_size;
+                        var cv_buffer: [64]u8 = undefined; // Max CV size
+                        const cv_slice = MultiSliceView.init(&self.buffer, &[_]u8{}, &[_]u8{});
+                        Variant.turboSHAKEToBuffer(&cv_slice, 0x0B, cv_buffer[0..cv_size]);
+
+                        // Absorb CV into final state immediately
+                        self.final_state.?.update(cv_buffer[0..cv_size]);
+                        self.num_leaves += 1;
+                    }
+                    self.buffer_len = 0;
+                }
+            }
+        }
+
+        /// Finalize the hash and produce output.
+        /// After calling this, the context should not be reused.
+        pub fn final(self: *Self, out: []u8) void {
+            const cv_size = Variant.cv_size;
+
+            // Calculate total length: message + customization + right_encode(customization.len)
+            const total_len = self.message_len + self.customization.len + self.custom_len_enc.len;
+
+            // Single chunk mode: total data fits in one chunk
+            if (total_len <= chunk_size) {
+                // Build the complete input: buffer + customization + encoded length
+                var single_chunk: [chunk_size]u8 = undefined;
+                @memcpy(single_chunk[0..self.buffer_len], self.buffer[0..self.buffer_len]);
+                @memcpy(single_chunk[self.buffer_len..][0..self.customization.len], self.customization);
+                @memcpy(single_chunk[self.buffer_len + self.customization.len ..][0..self.custom_len_enc.len], self.custom_len_enc.slice());
+
+                const view = MultiSliceView.init(single_chunk[0..total_len], &[_]u8{}, &[_]u8{});
+                singleChunkFn(&view, 0x07, out);
+                return;
+            }
+
+            // Tree mode: we've already absorbed first_chunk + padding + intermediate CVs
+            // Now handle remaining buffer data
+            const remaining_with_custom_len = self.buffer_len + self.customization.len + self.custom_len_enc.len;
+            var final_leaves = self.num_leaves;
+
+            if (remaining_with_custom_len > 0) {
+                // Build final leaf data with customization
+                var final_leaf_buffer: [chunk_size + 256]u8 = undefined; // Extra space for customization
+                @memcpy(final_leaf_buffer[0..self.buffer_len], self.buffer[0..self.buffer_len]);
+                @memcpy(final_leaf_buffer[self.buffer_len..][0..self.customization.len], self.customization);
+                @memcpy(final_leaf_buffer[self.buffer_len + self.customization.len ..][0..self.custom_len_enc.len], self.custom_len_enc.slice());
+
+                // Generate CV for final leaf and absorb it
+                var cv_buffer: [64]u8 = undefined; // Max CV size
+                const cv_slice = MultiSliceView.init(final_leaf_buffer[0..remaining_with_custom_len], &[_]u8{}, &[_]u8{});
+                Variant.turboSHAKEToBuffer(&cv_slice, 0x0B, cv_buffer[0..cv_size]);
+                self.final_state.?.update(cv_buffer[0..cv_size]);
+                final_leaves += 1;
+            }
+
+            // Absorb right_encode(num_leaves) and terminator
+            const n_enc = rightEncode(final_leaves);
+            self.final_state.?.update(n_enc.slice());
+            const terminator = [_]u8{ 0xFF, 0xFF };
+            self.final_state.?.update(&terminator);
+
+            // Squeeze output
+            self.final_state.?.final(out);
+        }
+
         /// Hash a message using sequential processing with SIMD acceleration.
         /// Best performance for inputs under 10MB. Never allocates memory.
         ///
@@ -1331,4 +1461,363 @@ test "KT256: pattern message (16385 bytes), empty customization, 64 bytes" {
     var expected: [64]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "C814F23132DADBFD55379F18CB988CB39B751F119322823FD982644A897485397B9F40EB11C6E416359B8AE695A5CE0FA79D1ADA1EEC745D82E0A5AB08A9F014");
     try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT128 incremental: empty message matches one-shot" {
+    var output_oneshot: [32]u8 = undefined;
+    var output_incremental: [32]u8 = undefined;
+
+    try KT128.hash(&[_]u8{}, null, &output_oneshot);
+
+    var hasher = KT128.init(null);
+    hasher.final(&output_incremental);
+
+    try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
+}
+
+test "KT128 incremental: small message matches one-shot" {
+    const message = "Hello, KangarooTwelve!";
+
+    var output_oneshot: [32]u8 = undefined;
+    var output_incremental: [32]u8 = undefined;
+
+    try KT128.hash(message, null, &output_oneshot);
+
+    var hasher = KT128.init(null);
+    hasher.update(message);
+    hasher.final(&output_incremental);
+
+    try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
+}
+
+test "KT128 incremental: multiple updates match single update" {
+    const part1 = "Hello, ";
+    const part2 = "Kangaroo";
+    const part3 = "Twelve!";
+
+    var output_single: [32]u8 = undefined;
+    var output_multi: [32]u8 = undefined;
+
+    // Single update
+    var hasher1 = KT128.init(null);
+    hasher1.update(part1 ++ part2 ++ part3);
+    hasher1.final(&output_single);
+
+    // Multiple updates
+    var hasher2 = KT128.init(null);
+    hasher2.update(part1);
+    hasher2.update(part2);
+    hasher2.update(part3);
+    hasher2.final(&output_multi);
+
+    try std.testing.expectEqualSlices(u8, &output_single, &output_multi);
+}
+
+test "KT128 incremental: exactly chunk_size matches one-shot" {
+    const allocator = std.testing.allocator;
+    const message = try allocator.alloc(u8, 8192);
+    defer allocator.free(message);
+    @memset(message, 0xAB);
+
+    var output_oneshot: [32]u8 = undefined;
+    var output_incremental: [32]u8 = undefined;
+
+    try KT128.hash(message, null, &output_oneshot);
+
+    var hasher = KT128.init(null);
+    hasher.update(message);
+    hasher.final(&output_incremental);
+
+    try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
+}
+
+test "KT128 incremental: larger than chunk_size matches one-shot" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 16384);
+    defer allocator.free(message);
+
+    var output_oneshot: [32]u8 = undefined;
+    var output_incremental: [32]u8 = undefined;
+
+    try KT128.hash(message, null, &output_oneshot);
+
+    var hasher = KT128.init(null);
+    hasher.update(message);
+    hasher.final(&output_incremental);
+
+    try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
+}
+
+test "KT128 incremental: with customization matches one-shot" {
+    const message = "Test message";
+    const customization = "my custom domain";
+
+    var output_oneshot: [32]u8 = undefined;
+    var output_incremental: [32]u8 = undefined;
+
+    try KT128.hash(message, customization, &output_oneshot);
+
+    var hasher = KT128.init(customization);
+    hasher.update(message);
+    hasher.final(&output_incremental);
+
+    try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
+}
+
+test "KT128 incremental: large message with customization" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 20000);
+    defer allocator.free(message);
+    const customization = "test domain";
+
+    var output_oneshot: [48]u8 = undefined;
+    var output_incremental: [48]u8 = undefined;
+
+    try KT128.hash(message, customization, &output_oneshot);
+
+    var hasher = KT128.init(customization);
+    hasher.update(message);
+    hasher.final(&output_incremental);
+
+    try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
+}
+
+test "KT128 incremental: streaming chunks matches one-shot" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 25000);
+    defer allocator.free(message);
+
+    var output_oneshot: [32]u8 = undefined;
+    var output_incremental: [32]u8 = undefined;
+
+    try KT128.hash(message, null, &output_oneshot);
+
+    var hasher = KT128.init(null);
+
+    // Feed in 1KB chunks
+    var offset: usize = 0;
+    while (offset < message.len) {
+        const chunk_size_local = @min(1024, message.len - offset);
+        hasher.update(message[offset..][0..chunk_size_local]);
+        offset += chunk_size_local;
+    }
+    hasher.final(&output_incremental);
+
+    try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
+}
+
+test "KT256 incremental: empty message matches one-shot" {
+    var output_oneshot: [64]u8 = undefined;
+    var output_incremental: [64]u8 = undefined;
+
+    try KT256.hash(&[_]u8{}, null, &output_oneshot);
+
+    var hasher = KT256.init(null);
+    hasher.final(&output_incremental);
+
+    try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
+}
+
+test "KT256 incremental: small message matches one-shot" {
+    const message = "Hello, KangarooTwelve with 256-bit security!";
+
+    var output_oneshot: [64]u8 = undefined;
+    var output_incremental: [64]u8 = undefined;
+
+    try KT256.hash(message, null, &output_oneshot);
+
+    var hasher = KT256.init(null);
+    hasher.update(message);
+    hasher.final(&output_incremental);
+
+    try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
+}
+
+test "KT256 incremental: large message matches one-shot" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 30000);
+    defer allocator.free(message);
+
+    var output_oneshot: [64]u8 = undefined;
+    var output_incremental: [64]u8 = undefined;
+
+    try KT256.hash(message, null, &output_oneshot);
+
+    var hasher = KT256.init(null);
+    hasher.update(message);
+    hasher.final(&output_incremental);
+
+    try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
+}
+
+test "KT256 incremental: with customization matches one-shot" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 15000);
+    defer allocator.free(message);
+    const customization = "KT256 custom domain";
+
+    var output_oneshot: [80]u8 = undefined;
+    var output_incremental: [80]u8 = undefined;
+
+    try KT256.hash(message, customization, &output_oneshot);
+
+    var hasher = KT256.init(customization);
+    hasher.update(message);
+    hasher.final(&output_incremental);
+
+    try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
+}
+
+test "KT128 incremental: random small message with random chunk sizes" {
+    const allocator = std.testing.allocator;
+
+    const test_sizes = [_]usize{ 100, 500, 2000, 5000, 10000 };
+
+    for (test_sizes) |total_size| {
+        const message = try allocator.alloc(u8, total_size);
+        defer allocator.free(message);
+        crypto.random.bytes(message);
+
+        var output_oneshot: [32]u8 = undefined;
+        var output_incremental: [32]u8 = undefined;
+
+        try KT128.hash(message, null, &output_oneshot);
+
+        var hasher = KT128.init(null);
+        var offset: usize = 0;
+
+        while (offset < message.len) {
+            const remaining = message.len - offset;
+            const max_chunk = @min(1000, remaining);
+            const chunk_size_local = if (max_chunk == 1) 1 else crypto.random.intRangeAtMost(usize, 1, max_chunk);
+
+            hasher.update(message[offset..][0..chunk_size_local]);
+            offset += chunk_size_local;
+        }
+        hasher.final(&output_incremental);
+
+        try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
+    }
+}
+
+test "KT128 incremental: random large message (1MB) with random chunk sizes" {
+    const allocator = std.testing.allocator;
+
+    const total_size: usize = 1024 * 1024; // 1 MB
+    const message = try allocator.alloc(u8, total_size);
+    defer allocator.free(message);
+    crypto.random.bytes(message);
+
+    var output_oneshot: [32]u8 = undefined;
+    var output_incremental: [32]u8 = undefined;
+
+    try KT128.hash(message, null, &output_oneshot);
+
+    var hasher = KT128.init(null);
+    var offset: usize = 0;
+
+    while (offset < message.len) {
+        const remaining = message.len - offset;
+        const max_chunk = @min(10000, remaining);
+        const chunk_size_local = if (max_chunk == 1) 1 else crypto.random.intRangeAtMost(usize, 1, max_chunk);
+
+        hasher.update(message[offset..][0..chunk_size_local]);
+        offset += chunk_size_local;
+    }
+    hasher.final(&output_incremental);
+
+    try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
+}
+
+test "KT256 incremental: random small message with random chunk sizes" {
+    const allocator = std.testing.allocator;
+
+    const test_sizes = [_]usize{ 100, 500, 2000, 5000, 10000 };
+
+    for (test_sizes) |total_size| {
+        // Generate random message
+        const message = try allocator.alloc(u8, total_size);
+        defer allocator.free(message);
+        crypto.random.bytes(message);
+
+        var output_oneshot: [64]u8 = undefined;
+        var output_incremental: [64]u8 = undefined;
+
+        try KT256.hash(message, null, &output_oneshot);
+
+        var hasher = KT256.init(null);
+        var offset: usize = 0;
+
+        while (offset < message.len) {
+            const remaining = message.len - offset;
+            const max_chunk = @min(1000, remaining);
+            const chunk_size_local = if (max_chunk == 1) 1 else crypto.random.intRangeAtMost(usize, 1, max_chunk);
+
+            hasher.update(message[offset..][0..chunk_size_local]);
+            offset += chunk_size_local;
+        }
+        hasher.final(&output_incremental);
+
+        try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
+    }
+}
+
+test "KT256 incremental: random large message (1MB) with random chunk sizes" {
+    const allocator = std.testing.allocator;
+
+    const total_size: usize = 1024 * 1024; // 1 MB
+    const message = try allocator.alloc(u8, total_size);
+    defer allocator.free(message);
+    crypto.random.bytes(message);
+
+    var output_oneshot: [64]u8 = undefined;
+    var output_incremental: [64]u8 = undefined;
+
+    try KT256.hash(message, null, &output_oneshot);
+
+    var hasher = KT256.init(null);
+    var offset: usize = 0;
+
+    while (offset < message.len) {
+        const remaining = message.len - offset;
+        const max_chunk = @min(10000, remaining);
+        const chunk_size_local = if (max_chunk == 1) 1 else crypto.random.intRangeAtMost(usize, 1, max_chunk);
+
+        hasher.update(message[offset..][0..chunk_size_local]);
+        offset += chunk_size_local;
+    }
+    hasher.final(&output_incremental);
+
+    try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
+}
+
+test "KT128 incremental: random message with customization and random chunks" {
+    const allocator = std.testing.allocator;
+
+    const total_size: usize = 50000;
+    const message = try allocator.alloc(u8, total_size);
+    defer allocator.free(message);
+    crypto.random.bytes(message);
+
+    const customization = "random test domain";
+
+    var output_oneshot: [48]u8 = undefined;
+    var output_incremental: [48]u8 = undefined;
+
+    try KT128.hash(message, customization, &output_oneshot);
+
+    var hasher = KT128.init(customization);
+    var offset: usize = 0;
+
+    while (offset < message.len) {
+        const remaining = message.len - offset;
+        const max_chunk = @min(5000, remaining);
+        const chunk_size_local = if (max_chunk == 1) 1 else crypto.random.intRangeAtMost(usize, 1, max_chunk);
+
+        hasher.update(message[offset..][0..chunk_size_local]);
+        offset += chunk_size_local;
+    }
+    hasher.final(&output_incremental);
+
+    try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
 }
