@@ -70,11 +70,7 @@ const BenchmarkResult = struct {
     sha256_mb_s: f64,
 };
 
-fn formatBytes(bytes: usize) []const u8 {
-    const buf = struct {
-        var buffer: [32]u8 = undefined;
-    };
-
+fn formatBytes(buffer: []u8, bytes: usize) []const u8 {
     var value: f64 = @floatFromInt(bytes);
     var unit: []const u8 = "B";
 
@@ -86,7 +82,7 @@ fn formatBytes(bytes: usize) []const u8 {
         unit = "KB";
     }
 
-    return std.fmt.bufPrint(&buf.buffer, "{d:.2} {s}", .{ value, unit }) catch unreachable;
+    return std.fmt.bufPrint(buffer, "{d:.2} {s}", .{ value, unit }) catch unreachable;
 }
 
 fn runBenchmark(name: []const u8, message: []const u8, allocator: std.mem.Allocator) !BenchmarkResult {
@@ -99,12 +95,14 @@ fn runBenchmark(name: []const u8, message: []const u8, allocator: std.mem.Alloca
     const chunks = (message.len + 8192 - 1) / 8192;
 
     // Fixed number of iterations based on message size
-    // Total bytes processed = 100 MB for all message sizes
-    const total_bytes_to_process: usize = 100_000_000;
+    // Total bytes processed = 500 MB for all message sizes
+    const total_bytes_to_process: usize = 500_000_000;
     const iterations: usize = @max(1, total_bytes_to_process / @max(1, message.len));
 
-    const msg_size_str = formatBytes(message.len);
-    const total_size_str = formatBytes(iterations * message.len);
+    var msg_size_buf: [32]u8 = undefined;
+    var total_size_buf: [32]u8 = undefined;
+    const msg_size_str = formatBytes(&msg_size_buf, message.len);
+    const total_size_str = formatBytes(&total_size_buf, iterations * message.len);
     print("  Processing {d} iterations × {s} = {s} total\n", .{
         iterations,
         msg_size_str,
