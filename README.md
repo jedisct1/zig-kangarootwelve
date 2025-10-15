@@ -14,7 +14,7 @@ KangarooTwelve inherits its security foundation from over 15 years of intensive 
 
 ### Proven Cryptographic Foundation
 
-Keccak underwent rigorous analysis during the SHA-3 competition (2008-2012), where it was evaluated by the world's leading cryptographers before being selected by NIST as the SHA-3 standard. The scrutiny hasn't stopped—cryptanalysts continue to study Keccak-based functions, with the most recent significant analysis published at CRYPTO 2024. After all these years of analysis, Keccak's security remains solid.
+Keccak underwent rigorous analysis during the SHA-3 competition (2008-2012), where it was evaluated by the world's leading cryptographers before being selected by NIST as the SHA-3 standard. The scrutiny hasn't stopped: cryptanalysts continue to study Keccak-based functions, with the most recent significant analysis published at CRYPTO 2024. After all these years of analysis, Keccak's security remains solid.
 
 KangarooTwelve uses the Keccak-p[1600,12] permutation with 12 rounds, exactly half the 24 rounds used in SHA-3. This design choice was made by the original Keccak team themselves, who leveraged their deep understanding of the permutation's security properties. Any cryptanalysis of Keccak directly applies to understanding K12's security.
 
