@@ -100,6 +100,28 @@ try KT128.hashParallel(large_data, null, &output, allocator);
 
 The implementation automatically adjusts the threshold for parallel processing based on CPU count (3MB for 8+ cores, 5MB for 4-7 cores, 10MB for 1-3 cores).
 
+### Incremental Hashing
+
+For streaming data or when you need to hash data incrementally:
+
+```zig
+const KT128 = kangarootwelve.KT128;
+
+// Initialize with optional customization string (no allocator needed)
+var hasher = KT128.init(null);
+
+// Add data incrementally
+hasher.update("Hello, ");
+hasher.update("Kangaroo");
+hasher.update("Twelve!");
+
+// Finalize and get output
+var output: [32]u8 = undefined;
+hasher.final(&output);
+```
+
+The incremental API requires no allocator and uses only fixed-size stack buffers. You can hash arbitrarily large messages by calling `update()` multiple times.
+
 ### Using KT256
 
 ```zig
@@ -108,13 +130,45 @@ var output: [64]u8 = undefined;
 try KT256.hash(message, null, &output);
 ```
 
+KT256 also supports the incremental API:
+
+```zig
+var hasher = KT256.init("optional-customization");
+hasher.update(data);
+var output: [64]u8 = undefined;
+hasher.final(&output);
+```
+
 ## API
 
 ### `KT128`
 
-A struct providing KangarooTwelve with 128-bit security based on TurboSHAKE128.
+KT128 is a stateful type providing KangarooTwelve with 128-bit security based on TurboSHAKE128.
 
-#### `hash(message: []const u8, customization: ?[]const u8, out: []u8) !void`
+#### Incremental Hashing API
+
+##### `init(customization: ?[]const u8) KT128`
+
+Initialize a new hashing context. No allocator required.
+
+- `customization`: Optional customization string for domain separation (can be `null`)
+- Returns: A new `KT128` instance
+
+##### `update(self: *KT128, data: []const u8) void`
+
+Absorb data into the hash state. Can be called multiple times to incrementally add data.
+
+- `data`: Input data to absorb
+
+##### `final(self: *KT128, out: []u8) void`
+
+Finalize the hash and produce output. After calling this, the context should not be reused.
+
+- `out`: Output buffer of any length (arbitrary sizes supported)
+
+#### One-Shot Hashing API
+
+##### `hash(message: []const u8, customization: ?[]const u8, out: []u8) !void`
 
 Hashes a message using sequential processing with SIMD optimizations.
 
@@ -122,7 +176,7 @@ Hashes a message using sequential processing with SIMD optimizations.
 - `customization`: Optional customization string (can be `null`)
 - `out`: Output buffer of any length
 
-#### `hashParallel(message: []const u8, customization: ?[]const u8, out: []u8, allocator: std.mem.Allocator) !void`
+##### `hashParallel(message: []const u8, customization: ?[]const u8, out: []u8, allocator: std.mem.Allocator) !void`
 
 Hashes a message with parallel chunk processing. Automatically uses sequential processing for smaller inputs to avoid thread pool overhead.
 
@@ -133,7 +187,7 @@ Hashes a message with parallel chunk processing. Automatically uses sequential p
 
 ### `KT256`
 
-Same API as `KT128`, but uses TurboSHAKE256 internally for 256-bit security.
+KT256 is a stateful type with the same API as `KT128`, but uses TurboSHAKE256 internally for 256-bit security. All methods (`init`, `update`, `final`, `hash`, `hashParallel`) work identically.
 
 ## Performance
 
