@@ -70,8 +70,11 @@ const BenchmarkResult = struct {
     sha256_mb_s: f64,
 };
 
-fn formatBytes(bytes: usize) [32]u8 {
-    var result: [32]u8 = undefined;
+fn formatBytes(bytes: usize) []const u8 {
+    const buf = struct {
+        var buffer: [32]u8 = undefined;
+    };
+
     var value: f64 = @floatFromInt(bytes);
     var unit: []const u8 = "B";
 
@@ -83,8 +86,7 @@ fn formatBytes(bytes: usize) [32]u8 {
         unit = "KB";
     }
 
-    _ = std.fmt.bufPrint(&result, "{d:.2} {s}", .{ value, unit }) catch unreachable;
-    return result;
+    return std.fmt.bufPrint(&buf.buffer, "{d:.2} {s}", .{ value, unit }) catch unreachable;
 }
 
 fn runBenchmark(name: []const u8, message: []const u8, allocator: std.mem.Allocator) !BenchmarkResult {
@@ -96,46 +98,18 @@ fn runBenchmark(name: []const u8, message: []const u8, allocator: std.mem.Alloca
 
     const chunks = (message.len + 8192 - 1) / 8192;
 
-    // For small inputs, run multiple iterations to get accurate timing
-    const min_runtime_ns: i128 = 50_000_000; // 50ms minimum for better precision
-    var iterations: usize = 1;
+    // Fixed number of iterations based on message size
+    // Total bytes processed = 100 MB for all message sizes
+    const total_bytes_to_process: usize = 100_000_000;
+    const iterations: usize = @max(1, total_bytes_to_process / @max(1, message.len));
 
-    // Do quick tests of all algorithms to determine iterations needed
-    var quick_timer = Timer.init();
-    var min_elapsed: i128 = std.math.maxInt(i128);
-
-    // Test KT128 sequential
-    quick_timer.startTimer();
-    try KT128.hash(message, null, &out_kt128_seq);
-    quick_timer.stopTimer();
-    std.mem.doNotOptimizeAway(&out_kt128_seq);
-    min_elapsed = @min(min_elapsed, quick_timer.elapsed());
-
-    // Test TurboSHAKE128
-    quick_timer.startTimer();
-    turboShake128Hash(message, &out_turboshake128);
-    quick_timer.stopTimer();
-    std.mem.doNotOptimizeAway(&out_turboshake128);
-    min_elapsed = @min(min_elapsed, quick_timer.elapsed());
-
-    // Test BLAKE3
-    quick_timer.startTimer();
-    Blake3.hash(message, &out_blake3, .{});
-    quick_timer.stopTimer();
-    std.mem.doNotOptimizeAway(&out_blake3);
-    min_elapsed = @min(min_elapsed, quick_timer.elapsed());
-
-    // Test SHA256
-    quick_timer.startTimer();
-    Sha256.hash(message, &out_sha256, .{});
-    quick_timer.stopTimer();
-    std.mem.doNotOptimizeAway(&out_sha256);
-    min_elapsed = @min(min_elapsed, quick_timer.elapsed());
-
-    // Calculate iterations based on fastest algorithm
-    if (min_elapsed < min_runtime_ns) {
-        iterations = @intCast(@divTrunc(min_runtime_ns, @max(min_elapsed, 1)) + 1);
-    }
+    const msg_size_str = formatBytes(message.len);
+    const total_size_str = formatBytes(iterations * message.len);
+    print("  Processing {d} iterations × {s} = {s} total\n", .{
+        iterations,
+        msg_size_str,
+        total_size_str,
+    });
 
     // KT128 Sequential benchmark
     var timer_kt128_seq = Timer.init();
