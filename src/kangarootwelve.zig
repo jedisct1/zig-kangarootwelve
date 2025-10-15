@@ -835,7 +835,7 @@ fn KTHash(
         pub fn hash(message: []const u8, customization: ?[]const u8, out: []u8) !void {
             const custom = customization orelse &[_]u8{};
 
-            // Right-encode customization length (stack-allocated)
+            // Right-encode customization length
             const custom_len_enc = rightEncode(custom.len);
 
             // Create zero-copy multi-slice view (no concatenation)
