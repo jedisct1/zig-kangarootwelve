@@ -64,10 +64,10 @@ var output: [32]u8 = undefined;
 const message = "Hello, KangarooTwelve!";
 
 // Hash with no customization string
-try KT128.hash(message, null, &output);
+try KT128.hash(message, &output, .{});
 
 // Or with a customization string
-try KT128.hash(message, "my-app-v1", &output);
+try KT128.hash(message, &output, .{ .customization = "my-app-v1" });
 ```
 
 ### Variable Output Length
@@ -77,11 +77,11 @@ const KT128 = kangarootwelve.KT128;
 
 // 64-byte output
 var output: [64]u8 = undefined;
-try KT128.hash(message, null, &output);
+try KT128.hash(message, &output, .{});
 
 // Any output length you need
 var large_output: [128]u8 = undefined;
-try KT128.hash(message, null, &large_output);
+try KT128.hash(message, &large_output, .{});
 ```
 
 ### Parallel Hashing
@@ -95,7 +95,7 @@ const large_data = try allocator.alloc(u8, 100 * 1024 * 1024); // 100MB
 defer allocator.free(large_data);
 
 var output: [32]u8 = undefined;
-try KT128.hashParallel(large_data, null, &output, allocator);
+try KT128.hashParallel(large_data, &output, .{}, allocator);
 ```
 
 The implementation automatically adjusts the threshold for parallel processing based on CPU count (3MB for 8+ cores, 5MB for 4-7 cores, 10MB for 1-3 cores).
@@ -107,8 +107,8 @@ For streaming data or when you need to hash data incrementally:
 ```zig
 const KT128 = kangarootwelve.KT128;
 
-// Initialize with optional customization string (no allocator needed)
-var hasher = KT128.init(null);
+// Initialize with no customization (no allocator needed)
+var hasher = KT128.init(.{});
 
 // Add data incrementally
 hasher.update("Hello, ");
@@ -127,13 +127,13 @@ The incremental API requires no allocator and uses only fixed-size stack buffers
 ```zig
 const KT256 = kangarootwelve.KT256;
 var output: [64]u8 = undefined;
-try KT256.hash(message, null, &output);
+try KT256.hash(message, &output, .{});
 ```
 
 KT256 also supports the incremental API:
 
 ```zig
-var hasher = KT256.init("optional-customization");
+var hasher = KT256.init(.{ .customization = "optional-customization" });
 hasher.update(data);
 var output: [64]u8 = undefined;
 hasher.final(&output);
@@ -145,13 +145,24 @@ hasher.final(&output);
 
 KT128 is a stateful type providing KangarooTwelve with 128-bit security based on TurboSHAKE128.
 
+#### Options
+
+```zig
+pub const Options = struct {
+    customization: ?[]const u8 = null,
+};
+```
+
+The `Options` struct allows passing optional configuration:
+- `customization`: Optional customization string for domain separation
+
 #### Incremental Hashing API
 
-##### `init(customization: ?[]const u8) KT128`
+##### `init(options: Options) KT128`
 
 Initialize a new hashing context. No allocator required.
 
-- `customization`: Optional customization string for domain separation (can be `null`)
+- `options`: Configuration options (use `.{}` for defaults, or `.{ .customization = "string" }` for custom domain separation)
 - Returns: A new `KT128` instance
 
 ##### `update(self: *KT128, data: []const u8) void`
@@ -168,21 +179,21 @@ Finalize the hash and produce output. After calling this, the context should not
 
 #### One-Shot Hashing API
 
-##### `hash(message: []const u8, customization: ?[]const u8, out: []u8) !void`
+##### `hash(message: []const u8, out: []u8, options: Options) !void`
 
 Hashes a message using sequential processing with SIMD optimizations.
 
 - `message`: Input data to hash
-- `customization`: Optional customization string (can be `null`)
 - `out`: Output buffer of any length
+- `options`: Configuration options (use `.{}` for defaults)
 
-##### `hashParallel(message: []const u8, customization: ?[]const u8, out: []u8, allocator: std.mem.Allocator) !void`
+##### `hashParallel(message: []const u8, out: []u8, options: Options, allocator: std.mem.Allocator) !void`
 
 Hashes a message with parallel chunk processing. Automatically uses sequential processing for smaller inputs to avoid thread pool overhead.
 
 - `message`: Input data to hash
-- `customization`: Optional customization string (can be `null`)
 - `out`: Output buffer of any length
+- `options`: Configuration options (use `.{}` for defaults)
 - `allocator`: Memory allocator for thread pool and intermediate buffers
 
 ### `KT256`

@@ -828,6 +828,11 @@ fn KTHash(
         const Self = @This();
         const StateType = Variant.StateType;
 
+        /// Options for KangarooTwelve can include a customization string for domain separation.
+        pub const Options = struct {
+            customization: ?[]const u8 = null,
+        };
+
         // Message buffer (accumulates message data only, not customization)
         buffer: [chunk_size]u8,
         buffer_len: usize,
@@ -844,8 +849,8 @@ fn KTHash(
 
         /// Initialize a KangarooTwelve hashing context.
         /// The customization string is optional and used for domain separation.
-        pub fn init(customization: ?[]const u8) Self {
-            const custom = customization orelse &[_]u8{};
+        pub fn init(options: Options) Self {
+            const custom = options.customization orelse &[_]u8{};
             return .{
                 .buffer = undefined,
                 .buffer_len = 0,
@@ -960,10 +965,10 @@ fn KTHash(
         ///
         /// Parameters:
         ///   - message: Input data to hash (any length)
-        ///   - customization: Optional domain separation string (or null)
         ///   - out: Output buffer (any length, arbitrary output sizes supported)
-        pub fn hash(message: []const u8, customization: ?[]const u8, out: []u8) !void {
-            const custom = customization orelse &[_]u8{};
+        ///   - options: Optional settings including customization string for domain separation
+        pub fn hash(message: []const u8, out: []u8, options: Options) !void {
+            const custom = options.customization orelse &[_]u8{};
 
             // Right-encode customization length
             const custom_len_enc = rightEncode(custom.len);
@@ -985,8 +990,8 @@ fn KTHash(
         /// Hash with automatic parallelization for large inputs (>3-10MB depending on CPU count).
         /// Automatically uses sequential processing for smaller inputs to avoid thread overhead.
         /// Allocator required for thread pool and temporary buffers.
-        pub fn hashParallel(message: []const u8, customization: ?[]const u8, out: []u8, allocator: Allocator) !void {
-            const custom = customization orelse &[_]u8{};
+        pub fn hashParallel(message: []const u8, out: []u8, options: Options, allocator: Allocator) !void {
+            const custom = options.customization orelse &[_]u8{};
 
             const custom_len_enc = rightEncode(custom.len);
             const view = MultiSliceView.init(message, custom, custom_len_enc.slice());
@@ -1057,10 +1062,10 @@ test "KT128 sequential and parallel produce same output for small inputs" {
         var output_par: [32]u8 = undefined;
 
         // Hash with sequential method
-        try KT128.hash(input, null, &output_seq);
+        try KT128.hash(input, &output_seq, .{});
 
         // Hash with parallel method
-        try KT128.hashParallel(input, null, &output_par, allocator);
+        try KT128.hashParallel(input, &output_par, .{}, allocator);
 
         // Verify outputs match
         try std.testing.expectEqualSlices(u8, &output_seq, &output_par);
@@ -1085,10 +1090,10 @@ test "KT128 sequential and parallel produce same output for large inputs" {
         var output_par: [64]u8 = undefined;
 
         // Hash with sequential method
-        try KT128.hash(input, null, &output_seq);
+        try KT128.hash(input, &output_seq, .{});
 
         // Hash with parallel method
-        try KT128.hashParallel(input, null, &output_par, allocator);
+        try KT128.hashParallel(input, &output_par, .{}, allocator);
 
         // Verify outputs match
         try std.testing.expectEqualSlices(u8, &output_seq, &output_par);
@@ -1110,10 +1115,10 @@ test "KT128 sequential and parallel produce same output with customization" {
     var output_par: [48]u8 = undefined;
 
     // Hash with sequential method
-    try KT128.hash(input, customization, &output_seq);
+    try KT128.hash(input, &output_seq, .{ .customization = customization });
 
     // Hash with parallel method
-    try KT128.hashParallel(input, customization, &output_par, allocator);
+    try KT128.hashParallel(input, &output_par, .{ .customization = customization }, allocator);
 
     // Verify outputs match
     try std.testing.expectEqualSlices(u8, &output_seq, &output_par);
@@ -1136,10 +1141,10 @@ test "KT256 sequential and parallel produce same output for small inputs" {
         var output_par: [64]u8 = undefined;
 
         // Hash with sequential method
-        try KT256.hash(input, null, &output_seq);
+        try KT256.hash(input, &output_seq, .{});
 
         // Hash with parallel method
-        try KT256.hashParallel(input, null, &output_par, allocator);
+        try KT256.hashParallel(input, &output_par, .{}, allocator);
 
         // Verify outputs match
         try std.testing.expectEqualSlices(u8, &output_seq, &output_par);
@@ -1163,10 +1168,10 @@ test "KT256 sequential and parallel produce same output for large inputs" {
         var output_par: [64]u8 = undefined;
 
         // Hash with sequential method
-        try KT256.hash(input, null, &output_seq);
+        try KT256.hash(input, &output_seq, .{});
 
         // Hash with parallel method
-        try KT256.hashParallel(input, null, &output_par, allocator);
+        try KT256.hashParallel(input, &output_par, .{}, allocator);
 
         // Verify outputs match
         try std.testing.expectEqualSlices(u8, &output_seq, &output_par);
@@ -1188,10 +1193,10 @@ test "KT256 sequential and parallel produce same output with customization" {
     var output_par: [80]u8 = undefined;
 
     // Hash with sequential method
-    try KT256.hash(input, customization, &output_seq);
+    try KT256.hash(input, &output_seq, .{ .customization = customization });
 
     // Hash with parallel method
-    try KT256.hashParallel(input, customization, &output_par, allocator);
+    try KT256.hashParallel(input, &output_par, .{ .customization = customization }, allocator);
 
     // Verify outputs match
     try std.testing.expectEqualSlices(u8, &output_seq, &output_par);
@@ -1208,7 +1213,7 @@ fn generatePattern(allocator: Allocator, len: usize) ![]u8 {
 
 test "KT128: empty message, empty customization, 32 bytes" {
     var output: [32]u8 = undefined;
-    try KT128.hash(&[_]u8{}, null, &output);
+    try KT128.hash(&[_]u8{}, &output, .{});
 
     var expected: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "1AC2D450FC3B4205D19DA7BFCA1B37513C0803577AC7167F06FE2CE1F0EF39E5");
@@ -1217,7 +1222,7 @@ test "KT128: empty message, empty customization, 32 bytes" {
 
 test "KT128: empty message, empty customization, 64 bytes" {
     var output: [64]u8 = undefined;
-    try KT128.hash(&[_]u8{}, null, &output);
+    try KT128.hash(&[_]u8{}, &output, .{});
 
     var expected: [64]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "1AC2D450FC3B4205D19DA7BFCA1B37513C0803577AC7167F06FE2CE1F0EF39E54269C056B8C82E48276038B6D292966CC07A3D4645272E31FF38508139EB0A71");
@@ -1229,7 +1234,7 @@ test "KT128: empty message, empty customization, 10032 bytes (last 32)" {
     const output = try allocator.alloc(u8, 10032);
     defer allocator.free(output);
 
-    try KT128.hash(&[_]u8{}, null, output);
+    try KT128.hash(&[_]u8{}, output, .{});
 
     var expected: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "E8DC563642F7228C84684C898405D3A834799158C079B12880277A1D28E2FF6D");
@@ -1242,7 +1247,7 @@ test "KT128: pattern message (1 byte), empty customization, 32 bytes" {
     defer allocator.free(message);
 
     var output: [32]u8 = undefined;
-    try KT128.hash(message, null, &output);
+    try KT128.hash(message, &output, .{});
 
     var expected: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "2BDA92450E8B147F8A7CB629E784A058EFCA7CF7D8218E02D345DFAA65244A1F");
@@ -1255,7 +1260,7 @@ test "KT128: pattern message (17 bytes), empty customization, 32 bytes" {
     defer allocator.free(message);
 
     var output: [32]u8 = undefined;
-    try KT128.hash(message, null, &output);
+    try KT128.hash(message, &output, .{});
 
     var expected: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "6BF75FA2239198DB4772E36478F8E19B0F371205F6A9A93A273F51DF37122888");
@@ -1268,7 +1273,7 @@ test "KT128: pattern message (289 bytes), empty customization, 32 bytes" {
     defer allocator.free(message);
 
     var output: [32]u8 = undefined;
-    try KT128.hash(message, null, &output);
+    try KT128.hash(message, &output, .{});
 
     var expected: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "0C315EBCDEDBF61426DE7DCF8FB725D1E74675D7F5327A5067F367B108ECB67C");
@@ -1282,7 +1287,7 @@ test "KT128: 0xFF message (1 byte), pattern customization (1 byte), 32 bytes" {
 
     const message = [_]u8{0xFF};
     var output: [32]u8 = undefined;
-    try KT128.hash(&message, customization, &output);
+    try KT128.hash(&message, &output, .{ .customization = customization });
 
     var expected: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "A20B92B251E3D62443EC286E4B9B470A4E8315C156EEB24878B038ABE20650BE");
@@ -1295,7 +1300,7 @@ test "KT128: pattern message (8191 bytes), empty customization, 32 bytes" {
     defer allocator.free(message);
 
     var output: [32]u8 = undefined;
-    try KT128.hash(message, null, &output);
+    try KT128.hash(message, &output, .{});
 
     var expected: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "1B577636F723643E990CC7D6A659837436FD6A103626600EB8301CD1DBE553D6");
@@ -1308,7 +1313,7 @@ test "KT128: pattern message (8192 bytes), empty customization, 32 bytes" {
     defer allocator.free(message);
 
     var output: [32]u8 = undefined;
-    try KT128.hash(message, null, &output);
+    try KT128.hash(message, &output, .{});
 
     var expected: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "48F256F6772F9EDFB6A8B661EC92DC93B95EBD05A08A17B39AE3490870C926C3");
@@ -1317,7 +1322,7 @@ test "KT128: pattern message (8192 bytes), empty customization, 32 bytes" {
 
 test "KT256: empty message, empty customization, 64 bytes" {
     var output: [64]u8 = undefined;
-    try KT256.hash(&[_]u8{}, null, &output);
+    try KT256.hash(&[_]u8{}, &output, .{});
 
     var expected: [64]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "B23D2E9CEA9F4904E02BEC06817FC10CE38CE8E93EF4C89E6537076AF8646404E3E8B68107B8833A5D30490AA33482353FD4ADC7148ECB782855003AAEBDE4A9");
@@ -1326,7 +1331,7 @@ test "KT256: empty message, empty customization, 64 bytes" {
 
 test "KT256: empty message, empty customization, 128 bytes" {
     var output: [128]u8 = undefined;
-    try KT256.hash(&[_]u8{}, null, &output);
+    try KT256.hash(&[_]u8{}, &output, .{});
 
     var expected: [128]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "B23D2E9CEA9F4904E02BEC06817FC10CE38CE8E93EF4C89E6537076AF8646404E3E8B68107B8833A5D30490AA33482353FD4ADC7148ECB782855003AAEBDE4A9B0925319D8EA1E121A609821EC19EFEA89E6D08DAEE1662B69C840289F188BA860F55760B61F82114C030C97E5178449608CCD2CD2D919FC7829FF69931AC4D0");
@@ -1339,7 +1344,7 @@ test "KT256: pattern message (1 byte), empty customization, 64 bytes" {
     defer allocator.free(message);
 
     var output: [64]u8 = undefined;
-    try KT256.hash(message, null, &output);
+    try KT256.hash(message, &output, .{});
 
     var expected: [64]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "0D005A194085360217128CF17F91E1F71314EFA5564539D444912E3437EFA17F82DB6F6FFE76E781EAA068BCE01F2BBF81EACB983D7230F2FB02834A21B1DDD0");
@@ -1352,7 +1357,7 @@ test "KT256: pattern message (17 bytes), empty customization, 64 bytes" {
     defer allocator.free(message);
 
     var output: [64]u8 = undefined;
-    try KT256.hash(message, null, &output);
+    try KT256.hash(message, &output, .{});
 
     var expected: [64]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "1BA3C02B1FC514474F06C8979978A9056C8483F4A1B63D0DCCEFE3A28A2F323E1CDCCA40EBF006AC76EF0397152346837B1277D3E7FAA9C9653B19075098527B");
@@ -1365,7 +1370,7 @@ test "KT256: pattern message (8191 bytes), empty customization, 64 bytes" {
     defer allocator.free(message);
 
     var output: [64]u8 = undefined;
-    try KT256.hash(message, null, &output);
+    try KT256.hash(message, &output, .{});
 
     var expected: [64]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "3081434D93A4108D8D8A3305B89682CEBEDC7CA4EA8A3CE869FBB73CBE4A58EEF6F24DE38FFC170514C70E7AB2D01F03812616E863D769AFB3753193BA045B20");
@@ -1378,7 +1383,7 @@ test "KT256: pattern message (8192 bytes), empty customization, 64 bytes" {
     defer allocator.free(message);
 
     var output: [64]u8 = undefined;
-    try KT256.hash(message, null, &output);
+    try KT256.hash(message, &output, .{});
 
     var expected: [64]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "C6EE8E2AD3200C018AC87AAA031CDAC22121B412D07DC6E0DCCBB53423747E9A1C18834D99DF596CF0CF4B8DFAFB7BF02D139D0C9035725ADC1A01B7230A41FA");
@@ -1391,7 +1396,7 @@ test "KT128: pattern message (8193 bytes), empty customization, 32 bytes" {
     defer allocator.free(message);
 
     var output: [32]u8 = undefined;
-    try KT128.hash(message, null, &output);
+    try KT128.hash(message, &output, .{});
 
     var expected: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "BB66FE72EAEA5179418D5295EE1344854D8AD7F3FA17EFCB467EC152341284CF");
@@ -1404,7 +1409,7 @@ test "KT128: pattern message (16384 bytes), empty customization, 32 bytes" {
     defer allocator.free(message);
 
     var output: [32]u8 = undefined;
-    try KT128.hash(message, null, &output);
+    try KT128.hash(message, &output, .{});
 
     var expected: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "82778F7F7234C83352E76837B721FBDBB5270B88010D84FA5AB0B61EC8CE0956");
@@ -1417,7 +1422,7 @@ test "KT128: pattern message (16385 bytes), empty customization, 32 bytes" {
     defer allocator.free(message);
 
     var output: [32]u8 = undefined;
-    try KT128.hash(message, null, &output);
+    try KT128.hash(message, &output, .{});
 
     var expected: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "5F8D2B943922B451842B4E82740D02369E2D5F9F33C5123509A53B955FE177B2");
@@ -1430,7 +1435,7 @@ test "KT256: pattern message (8193 bytes), empty customization, 64 bytes" {
     defer allocator.free(message);
 
     var output: [64]u8 = undefined;
-    try KT256.hash(message, null, &output);
+    try KT256.hash(message, &output, .{});
 
     var expected: [64]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "65FF03335900E5197ACBD5F41B797F0E7E36AD4FF7D89C09FA6F28AE58D1E8BC2DF1779B86F988C3B13690172914EA172423B23EF4057255BB0836AB3A99836E");
@@ -1443,7 +1448,7 @@ test "KT256: pattern message (16384 bytes), empty customization, 64 bytes" {
     defer allocator.free(message);
 
     var output: [64]u8 = undefined;
-    try KT256.hash(message, null, &output);
+    try KT256.hash(message, &output, .{});
 
     var expected: [64]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "74604239A14847CB79069B4FF0E51070A93034C9AC4DFF4D45E0F2C5DA81D930DE6055C2134B4DF4E49F27D1B2C66E95491858B182A924BD0504DA5976BC516D");
@@ -1456,7 +1461,7 @@ test "KT256: pattern message (16385 bytes), empty customization, 64 bytes" {
     defer allocator.free(message);
 
     var output: [64]u8 = undefined;
-    try KT256.hash(message, null, &output);
+    try KT256.hash(message, &output, .{});
 
     var expected: [64]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "C814F23132DADBFD55379F18CB988CB39B751F119322823FD982644A897485397B9F40EB11C6E416359B8AE695A5CE0FA79D1ADA1EEC745D82E0A5AB08A9F014");
@@ -1467,9 +1472,9 @@ test "KT128 incremental: empty message matches one-shot" {
     var output_oneshot: [32]u8 = undefined;
     var output_incremental: [32]u8 = undefined;
 
-    try KT128.hash(&[_]u8{}, null, &output_oneshot);
+    try KT128.hash(&[_]u8{}, &output_oneshot, .{});
 
-    var hasher = KT128.init(null);
+    var hasher = KT128.init(.{});
     hasher.final(&output_incremental);
 
     try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
@@ -1481,9 +1486,9 @@ test "KT128 incremental: small message matches one-shot" {
     var output_oneshot: [32]u8 = undefined;
     var output_incremental: [32]u8 = undefined;
 
-    try KT128.hash(message, null, &output_oneshot);
+    try KT128.hash(message, &output_oneshot, .{});
 
-    var hasher = KT128.init(null);
+    var hasher = KT128.init(.{});
     hasher.update(message);
     hasher.final(&output_incremental);
 
@@ -1499,12 +1504,12 @@ test "KT128 incremental: multiple updates match single update" {
     var output_multi: [32]u8 = undefined;
 
     // Single update
-    var hasher1 = KT128.init(null);
+    var hasher1 = KT128.init(.{});
     hasher1.update(part1 ++ part2 ++ part3);
     hasher1.final(&output_single);
 
     // Multiple updates
-    var hasher2 = KT128.init(null);
+    var hasher2 = KT128.init(.{});
     hasher2.update(part1);
     hasher2.update(part2);
     hasher2.update(part3);
@@ -1522,9 +1527,9 @@ test "KT128 incremental: exactly chunk_size matches one-shot" {
     var output_oneshot: [32]u8 = undefined;
     var output_incremental: [32]u8 = undefined;
 
-    try KT128.hash(message, null, &output_oneshot);
+    try KT128.hash(message, &output_oneshot, .{});
 
-    var hasher = KT128.init(null);
+    var hasher = KT128.init(.{});
     hasher.update(message);
     hasher.final(&output_incremental);
 
@@ -1539,9 +1544,9 @@ test "KT128 incremental: larger than chunk_size matches one-shot" {
     var output_oneshot: [32]u8 = undefined;
     var output_incremental: [32]u8 = undefined;
 
-    try KT128.hash(message, null, &output_oneshot);
+    try KT128.hash(message, &output_oneshot, .{});
 
-    var hasher = KT128.init(null);
+    var hasher = KT128.init(.{});
     hasher.update(message);
     hasher.final(&output_incremental);
 
@@ -1555,9 +1560,9 @@ test "KT128 incremental: with customization matches one-shot" {
     var output_oneshot: [32]u8 = undefined;
     var output_incremental: [32]u8 = undefined;
 
-    try KT128.hash(message, customization, &output_oneshot);
+    try KT128.hash(message, &output_oneshot, .{ .customization = customization });
 
-    var hasher = KT128.init(customization);
+    var hasher = KT128.init(.{ .customization = customization });
     hasher.update(message);
     hasher.final(&output_incremental);
 
@@ -1573,9 +1578,9 @@ test "KT128 incremental: large message with customization" {
     var output_oneshot: [48]u8 = undefined;
     var output_incremental: [48]u8 = undefined;
 
-    try KT128.hash(message, customization, &output_oneshot);
+    try KT128.hash(message, &output_oneshot, .{ .customization = customization });
 
-    var hasher = KT128.init(customization);
+    var hasher = KT128.init(.{ .customization = customization });
     hasher.update(message);
     hasher.final(&output_incremental);
 
@@ -1590,9 +1595,9 @@ test "KT128 incremental: streaming chunks matches one-shot" {
     var output_oneshot: [32]u8 = undefined;
     var output_incremental: [32]u8 = undefined;
 
-    try KT128.hash(message, null, &output_oneshot);
+    try KT128.hash(message, &output_oneshot, .{});
 
-    var hasher = KT128.init(null);
+    var hasher = KT128.init(.{});
 
     // Feed in 1KB chunks
     var offset: usize = 0;
@@ -1610,9 +1615,9 @@ test "KT256 incremental: empty message matches one-shot" {
     var output_oneshot: [64]u8 = undefined;
     var output_incremental: [64]u8 = undefined;
 
-    try KT256.hash(&[_]u8{}, null, &output_oneshot);
+    try KT256.hash(&[_]u8{}, &output_oneshot, .{});
 
-    var hasher = KT256.init(null);
+    var hasher = KT256.init(.{});
     hasher.final(&output_incremental);
 
     try std.testing.expectEqualSlices(u8, &output_oneshot, &output_incremental);
@@ -1624,9 +1629,9 @@ test "KT256 incremental: small message matches one-shot" {
     var output_oneshot: [64]u8 = undefined;
     var output_incremental: [64]u8 = undefined;
 
-    try KT256.hash(message, null, &output_oneshot);
+    try KT256.hash(message, &output_oneshot, .{});
 
-    var hasher = KT256.init(null);
+    var hasher = KT256.init(.{});
     hasher.update(message);
     hasher.final(&output_incremental);
 
@@ -1641,9 +1646,9 @@ test "KT256 incremental: large message matches one-shot" {
     var output_oneshot: [64]u8 = undefined;
     var output_incremental: [64]u8 = undefined;
 
-    try KT256.hash(message, null, &output_oneshot);
+    try KT256.hash(message, &output_oneshot, .{});
 
-    var hasher = KT256.init(null);
+    var hasher = KT256.init(.{});
     hasher.update(message);
     hasher.final(&output_incremental);
 
@@ -1659,9 +1664,9 @@ test "KT256 incremental: with customization matches one-shot" {
     var output_oneshot: [80]u8 = undefined;
     var output_incremental: [80]u8 = undefined;
 
-    try KT256.hash(message, customization, &output_oneshot);
+    try KT256.hash(message, &output_oneshot, .{ .customization = customization });
 
-    var hasher = KT256.init(customization);
+    var hasher = KT256.init(.{ .customization = customization });
     hasher.update(message);
     hasher.final(&output_incremental);
 
@@ -1681,9 +1686,9 @@ test "KT128 incremental: random small message with random chunk sizes" {
         var output_oneshot: [32]u8 = undefined;
         var output_incremental: [32]u8 = undefined;
 
-        try KT128.hash(message, null, &output_oneshot);
+        try KT128.hash(message, &output_oneshot, .{});
 
-        var hasher = KT128.init(null);
+        var hasher = KT128.init(.{});
         var offset: usize = 0;
 
         while (offset < message.len) {
@@ -1711,9 +1716,9 @@ test "KT128 incremental: random large message (1MB) with random chunk sizes" {
     var output_oneshot: [32]u8 = undefined;
     var output_incremental: [32]u8 = undefined;
 
-    try KT128.hash(message, null, &output_oneshot);
+    try KT128.hash(message, &output_oneshot, .{});
 
-    var hasher = KT128.init(null);
+    var hasher = KT128.init(.{});
     var offset: usize = 0;
 
     while (offset < message.len) {
@@ -1743,9 +1748,9 @@ test "KT256 incremental: random small message with random chunk sizes" {
         var output_oneshot: [64]u8 = undefined;
         var output_incremental: [64]u8 = undefined;
 
-        try KT256.hash(message, null, &output_oneshot);
+        try KT256.hash(message, &output_oneshot, .{});
 
-        var hasher = KT256.init(null);
+        var hasher = KT256.init(.{});
         var offset: usize = 0;
 
         while (offset < message.len) {
@@ -1773,9 +1778,9 @@ test "KT256 incremental: random large message (1MB) with random chunk sizes" {
     var output_oneshot: [64]u8 = undefined;
     var output_incremental: [64]u8 = undefined;
 
-    try KT256.hash(message, null, &output_oneshot);
+    try KT256.hash(message, &output_oneshot, .{});
 
-    var hasher = KT256.init(null);
+    var hasher = KT256.init(.{});
     var offset: usize = 0;
 
     while (offset < message.len) {
@@ -1804,9 +1809,9 @@ test "KT128 incremental: random message with customization and random chunks" {
     var output_oneshot: [48]u8 = undefined;
     var output_incremental: [48]u8 = undefined;
 
-    try KT128.hash(message, customization, &output_oneshot);
+    try KT128.hash(message, &output_oneshot, .{ .customization = customization });
 
-    var hasher = KT128.init(customization);
+    var hasher = KT128.init(.{ .customization = customization });
     var offset: usize = 0;
 
     while (offset < message.len) {

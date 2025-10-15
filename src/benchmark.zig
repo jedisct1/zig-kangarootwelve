@@ -110,7 +110,7 @@ fn runBenchmark(name: []const u8, message: []const u8, allocator: std.mem.Alloca
     var timer_kt128_seq = Timer.init();
     timer_kt128_seq.startTimer();
     for (0..iterations) |_| {
-        try KT128.hash(message, null, &out_kt128_seq);
+        try KT128.hash(message, &out_kt128_seq, .{});
         std.mem.doNotOptimizeAway(&out_kt128_seq);
     }
     timer_kt128_seq.stopTimer();
@@ -120,7 +120,7 @@ fn runBenchmark(name: []const u8, message: []const u8, allocator: std.mem.Alloca
     var timer_kt128_par = Timer.init();
     timer_kt128_par.startTimer();
     for (0..iterations) |_| {
-        try KT128.hashParallel(message, null, &out_kt128_par, allocator);
+        try KT128.hashParallel(message, &out_kt128_par, .{}, allocator);
         std.mem.doNotOptimizeAway(&out_kt128_par);
     }
     timer_kt128_par.stopTimer();
