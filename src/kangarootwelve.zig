@@ -228,7 +228,7 @@ fn keccakP1600timesN(comptime N: usize, states: *[5][5]@Vector(N, u64)) void {
     };
 
     inline for (RC) |rc| {
-        // θ (theta) - fully unrolled
+        // θ (theta)
         var C: [5]@Vector(N, u64) = undefined;
         inline for (0..5) |x| {
             C[x] = states[x][0] ^ states[x][1] ^ states[x][2] ^ states[x][3] ^ states[x][4];
@@ -242,7 +242,7 @@ fn keccakP1600timesN(comptime N: usize, states: *[5][5]@Vector(N, u64)) void {
         D[3] = C[2] ^ rol64Vec(N, C[4], 1);
         D[4] = C[3] ^ rol64Vec(N, C[0], 1);
 
-        // Apply D to all lanes - fully unrolled
+        // Apply D to all lanes
         inline for (0..5) |x| {
             states[x][0] ^= D[x];
             states[x][1] ^= D[x];
