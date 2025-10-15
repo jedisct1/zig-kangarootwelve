@@ -1,9 +1,8 @@
 const std = @import("std");
 const kangarootwelve = @import("kangarootwelve");
 
-// Import the KT128 implementation from the library
 const KT128 = kangarootwelve.KT128;
-const TurboSHAKE128State = kangarootwelve.TurboSHAKE128State;
+const TurboShake128 = std.crypto.hash.sha3.TurboShake128(0x1f);
 const Blake3 = std.crypto.hash.Blake3;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -11,9 +10,7 @@ const print = std.debug.print;
 
 // Helper function for TurboSHAKE128
 fn turboShake128Hash(message: []const u8, output: []u8) void {
-    var state = TurboSHAKE128State.init();
-    state.update(message);
-    state.finalize(0x1F, output);
+    TurboShake128.hash(message, output, .{});
 }
 
 // Simple timer for benchmarking
