@@ -1,5 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const crypto = std.crypto;
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
 const Pool = Thread.Pool;
 const WaitGroup = Thread.WaitGroup;
@@ -49,7 +52,7 @@ fn KangarooVariant(
     comptime pad_x: usize,
     comptime pad_y: usize,
     comptime toBufferFn: fn (*const MultiSliceView, u8, []u8) void,
-    comptime allocFn: fn (std.mem.Allocator, *const MultiSliceView, u8, usize) anyerror![]u8,
+    comptime allocFn: fn (Allocator, *const MultiSliceView, u8, usize) anyerror![]u8,
 ) type {
     return struct {
         const rate = rate_bytes;
@@ -63,7 +66,7 @@ fn KangarooVariant(
             toBufferFn(view, separation_byte, output);
         }
 
-        inline fn turboSHAKEMultiSliceAlloc(allocator: std.mem.Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
+        inline fn turboSHAKEMultiSliceAlloc(allocator: Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
             return allocFn(allocator, view, separation_byte, output_len);
         }
     };
@@ -106,13 +109,13 @@ inline fn rol64Vec(comptime N: usize, v: @Vector(N, u64), comptime n: u6) @Vecto
 
 /// Load a 64-bit little-endian value
 inline fn load64(bytes: []const u8) u64 {
-    std.debug.assert(bytes.len >= 8);
+    assert(bytes.len >= 8);
     return std.mem.readInt(u64, bytes[0..8], .little);
 }
 
 /// Store a 64-bit little-endian value
 inline fn store64(value: u64, bytes: []u8) void {
-    std.debug.assert(bytes.len >= 8);
+    assert(bytes.len >= 8);
     std.mem.writeInt(u64, bytes[0..8], value, .little);
 }
 
@@ -284,7 +287,7 @@ fn keccakP1600timesN(comptime N: usize, states: *[5][5]@Vector(N, u64)) void {
 
 /// Add lanes from data to N states in parallel with stride - optimized version
 fn addLanesAll(comptime N: usize, states: *[5][5]@Vector(N, u64), data: []const u8, lane_count: usize, lane_offset: usize) void {
-    std.debug.assert(data.len >= 8 * ((N - 1) * lane_offset + lane_count));
+    assert(data.len >= 8 * ((N - 1) * lane_offset + lane_count));
 
     // Process lanes (at most 25 lanes in Keccak state)
     inline for (0..25) |xy| {
@@ -452,7 +455,7 @@ fn turboSHAKEMultiSliceToBuffer(comptime rate: usize, view: *const MultiSliceVie
 }
 
 /// Generic allocating TurboSHAKE
-fn turboSHAKEMultiSlice(comptime rate: usize, allocator: std.mem.Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
+fn turboSHAKEMultiSlice(comptime rate: usize, allocator: Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
     const output = try allocator.alloc(u8, output_len);
     turboSHAKEMultiSliceToBuffer(rate, view, separation_byte, output);
     return output;
@@ -464,7 +467,7 @@ fn turboSHAKE128MultiSliceToBuffer(view: *const MultiSliceView, separation_byte:
 }
 
 /// Allocating TurboSHAKE128
-fn turboSHAKE128MultiSlice(allocator: std.mem.Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
+fn turboSHAKE128MultiSlice(allocator: Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
     return turboSHAKEMultiSlice(168, allocator, view, separation_byte, output_len);
 }
 
@@ -474,121 +477,21 @@ fn turboSHAKE256MultiSliceToBuffer(view: *const MultiSliceView, separation_byte:
 }
 
 /// Allocating TurboSHAKE256
-fn turboSHAKE256MultiSlice(allocator: std.mem.Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
+fn turboSHAKE256MultiSlice(allocator: Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
     return turboSHAKEMultiSlice(136, allocator, view, separation_byte, output_len);
 }
 
-/// Generic streaming TurboSHAKE state for incremental hashing
-fn TurboSHAKEState(comptime rate: usize) type {
-    return struct {
-        lanes: [25]u64,
-        buf: [rate]u8,
-        buf_pos: usize,
+/// Streaming TurboSHAKE128 state from standard library for incremental hashing.
+/// Uses delimiter 0x06 for the final node in tree hashing.
+const TurboSHAKE128State = crypto.hash.sha3.TurboShake128(0x06);
 
-        const Self = @This();
-
-        /// Initialize a new TurboSHAKE state
-        pub fn init() Self {
-            return .{
-                .lanes = @splat(0),
-                .buf = undefined,
-                .buf_pos = 0,
-            };
-        }
-
-        /// Absorb data incrementally (can be called multiple times)
-        pub fn update(self: *Self, data: []const u8) void {
-            var i: usize = 0;
-
-            // Fill partial buffer first
-            if (self.buf_pos > 0) {
-                const remaining = rate - self.buf_pos;
-                const to_copy = @min(remaining, data.len);
-                @memcpy(self.buf[self.buf_pos..][0..to_copy], data[0..to_copy]);
-                self.buf_pos += to_copy;
-                i = to_copy;
-
-                if (self.buf_pos == rate) {
-                    // XOR buffer into state and permute
-                    var lane_idx: usize = 0;
-                    while (lane_idx * 8 < rate) : (lane_idx += 1) {
-                        self.lanes[lane_idx] ^= load64(self.buf[lane_idx * 8 ..]);
-                    }
-                    keccakPLanes(&self.lanes);
-                    self.buf_pos = 0;
-                }
-
-                if (i == data.len) return;
-            }
-
-            // Process complete blocks
-            while (i + rate <= data.len) {
-                var lane_idx: usize = 0;
-                while (lane_idx * 8 < rate) : (lane_idx += 1) {
-                    self.lanes[lane_idx] ^= load64(data[i + lane_idx * 8 ..]);
-                }
-                keccakPLanes(&self.lanes);
-                i += rate;
-            }
-
-            // Buffer remaining bytes
-            if (i < data.len) {
-                const remaining = data.len - i;
-                @memcpy(self.buf[0..remaining], data[i..]);
-                self.buf_pos = remaining;
-            }
-        }
-
-        /// Finalize and squeeze output (consumes the state)
-        pub fn finalize(self: *Self, separation_byte: u8, output: []u8) void {
-            // Pad and finalize absorption
-            self.buf[self.buf_pos] = separation_byte;
-            @memset(self.buf[self.buf_pos + 1 .. rate], 0);
-            self.buf[rate - 1] |= 0x80;
-
-            // XOR final buffer into state
-            var lane_idx: usize = 0;
-            while (lane_idx * 8 < rate) : (lane_idx += 1) {
-                self.lanes[lane_idx] ^= load64(self.buf[lane_idx * 8 ..]);
-            }
-            keccakPLanes(&self.lanes);
-
-            // Squeeze
-            var out_offset: usize = 0;
-            while (out_offset < output.len) {
-                const chunk = @min(rate, output.len - out_offset);
-
-                // Extract lanes to output
-                var byte_idx: usize = 0;
-                while (byte_idx < chunk) {
-                    const lane = byte_idx / 8;
-                    const lane_byte = byte_idx % 8;
-                    output[out_offset + byte_idx] = @truncate(self.lanes[lane] >> @as(u6, @intCast(lane_byte * 8)));
-                    byte_idx += 1;
-                }
-
-                out_offset += chunk;
-                if (out_offset < output.len) {
-                    keccakPLanes(&self.lanes);
-                }
-            }
-        }
-    };
-}
-
-/// Streaming TurboSHAKE128 state for incremental hashing.
-/// Allows processing data in chunks without buffering everything in memory.
-/// Usage: init() -> update() (multiple times) -> finalize().
-const TurboSHAKE128State = TurboSHAKEState(168);
-
-/// Streaming TurboSHAKE256 state for incremental hashing.
-/// Allows processing data in chunks without buffering everything in memory.
-/// Usage: init() -> update() (multiple times) -> finalize().
-const TurboSHAKE256State = TurboSHAKEState(136);
+/// Streaming TurboSHAKE256 state from standard library for incremental hashing.
+/// Uses delimiter 0x06 for the final node in tree hashing.
+const TurboSHAKE256State = crypto.hash.sha3.TurboShake256(0x06);
 
 /// Process N leaves (8KiB chunks) in parallel - generic version
 fn processLeaves(comptime Variant: type, comptime N: usize, data: []const u8, result: *[N * Variant.cv_size]u8) void {
-    std.debug.assert(data.len >= N * B);
+    assert(data.len >= N * B);
 
     const rate_in_lanes: usize = Variant.rate_in_lanes;
     const rate_in_bytes: usize = rate_in_lanes * 8;
@@ -734,8 +637,8 @@ fn ktSingleThreaded(comptime Variant: type, view: *const MultiSliceView, total_l
     const cv_size = Variant.cv_size;
     const StateType = Variant.StateType;
 
-    // Initialize streaming TurboSHAKE state for final node
-    var final_state = StateType.init();
+    // Initialize streaming TurboSHAKE state for final node (delimiter 0x06 is set in the type)
+    var final_state = StateType.init(.{});
 
     // Absorb first B bytes from input
     var first_b_buffer: [B]u8 = undefined;
@@ -790,11 +693,11 @@ fn ktSingleThreaded(comptime Variant: type, view: *const MultiSliceView, total_l
     final_state.update(&terminator);
 
     // Finalize and squeeze output
-    final_state.finalize(0x06, output);
+    final_state.final(output);
 }
 
 /// Generic multi-threaded implementation
-fn ktMultiThreaded(comptime Variant: type, allocator: std.mem.Allocator, view: *const MultiSliceView, total_len: usize, output: []u8) !void {
+fn ktMultiThreaded(comptime Variant: type, allocator: Allocator, view: *const MultiSliceView, total_len: usize, output: []u8) !void {
     const cv_size = Variant.cv_size;
 
     // Calculate total number of leaves
@@ -912,7 +815,7 @@ fn KTHash(
         /// Hash with automatic parallelization for large inputs (>3-10MB depending on CPU count).
         /// Automatically uses sequential processing for smaller inputs to avoid thread overhead.
         /// Allocator required for thread pool and temporary buffers.
-        pub fn hashParallel(message: []const u8, customization: ?[]const u8, out: []u8, allocator: std.mem.Allocator) !void {
+        pub fn hashParallel(message: []const u8, customization: ?[]const u8, out: []u8, allocator: Allocator) !void {
             const custom = customization orelse &[_]u8{};
 
             const custom_len_enc = rightEncode(custom.len);
@@ -978,7 +881,7 @@ test "KT128 sequential and parallel produce same output for small inputs" {
         defer allocator.free(input);
 
         // Fill with random data
-        std.crypto.random.bytes(input);
+        crypto.random.bytes(input);
 
         var output_seq: [32]u8 = undefined;
         var output_par: [32]u8 = undefined;
@@ -1006,7 +909,7 @@ test "KT128 sequential and parallel produce same output for large inputs" {
         defer allocator.free(input);
 
         // Fill with random data
-        std.crypto.random.bytes(input);
+        crypto.random.bytes(input);
 
         var output_seq: [64]u8 = undefined;
         var output_par: [64]u8 = undefined;
@@ -1030,7 +933,7 @@ test "KT128 sequential and parallel produce same output with customization" {
     defer allocator.free(input);
 
     // Fill with random data
-    std.crypto.random.bytes(input);
+    crypto.random.bytes(input);
 
     const customization = "test domain";
     var output_seq: [48]u8 = undefined;
@@ -1057,7 +960,7 @@ test "KT256 sequential and parallel produce same output for small inputs" {
         defer allocator.free(input);
 
         // Fill with random data
-        std.crypto.random.bytes(input);
+        crypto.random.bytes(input);
 
         var output_seq: [64]u8 = undefined;
         var output_par: [64]u8 = undefined;
@@ -1084,7 +987,7 @@ test "KT256 sequential and parallel produce same output for large inputs" {
         defer allocator.free(input);
 
         // Fill with random data
-        std.crypto.random.bytes(input);
+        crypto.random.bytes(input);
 
         var output_seq: [64]u8 = undefined;
         var output_par: [64]u8 = undefined;
@@ -1108,7 +1011,7 @@ test "KT256 sequential and parallel produce same output with customization" {
     defer allocator.free(input);
 
     // Fill with random data
-    std.crypto.random.bytes(input);
+    crypto.random.bytes(input);
 
     const customization = "test domain";
     var output_seq: [80]u8 = undefined;
@@ -1125,7 +1028,7 @@ test "KT256 sequential and parallel produce same output with customization" {
 }
 
 /// Helper: Generate pattern data where data[i] = (i % 251)
-fn generatePattern(allocator: std.mem.Allocator, len: usize) ![]u8 {
+fn generatePattern(allocator: Allocator, len: usize) ![]u8 {
     const data = try allocator.alloc(u8, len);
     for (data, 0..) |*byte, i| {
         byte.* = @intCast(i % 251);
