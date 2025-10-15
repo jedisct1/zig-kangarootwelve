@@ -1,6 +1,6 @@
 .{
     .name = .kangarootwelve,
-    .version = "0.0.4",
+    .version = "0.0.5",
     .minimum_zig_version = "0.15.1",
     .fingerprint = 0x3f3bf5a914538228,
     .dependencies = .{},

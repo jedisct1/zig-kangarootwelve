@@ -35,7 +35,7 @@ Add this package to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .kangarootwelve = .{
-        .url = "https://github.com/jedisct1/zig-kangarootwelve/archive/refs/tags/v0.0.3.tar.gz",
+        .url = "https://github.com/jedisct1/zig-kangarootwelve/archive/refs/tags/v0.0.5.tar.gz",
         .hash = "...",
     },
 },
