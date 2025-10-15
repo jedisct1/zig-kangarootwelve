@@ -417,7 +417,7 @@ fn keccakPLanes(lanes: *[25]u64) void {
 
 /// Generic non-allocating TurboSHAKE: write output to provided buffer
 fn turboSHAKEMultiSliceToBuffer(comptime rate: usize, view: *const MultiSliceView, separation_byte: u8, output: []u8) void {
-    var state = [_]u8{0} ** 200;
+    var state: [200]u8 = @splat(0);
     var state_pos: usize = 0;
 
     // Absorb all bytes from the multi-slice view
@@ -490,7 +490,7 @@ fn TurboSHAKEState(comptime rate: usize) type {
         /// Initialize a new TurboSHAKE state
         pub fn init() Self {
             return .{
-                .lanes = [_]u64{0} ** 25,
+                .lanes = @splat(0),
                 .buf = undefined,
                 .buf_pos = 0,
             };
@@ -966,3 +966,426 @@ pub const KT128 = KTHash(KT128Variant, turboSHAKE128MultiSliceToBuffer);
 /// Use KT256 when you need extra conservative margins.
 /// For most applications, KT128 offers better performance with adequate security.
 pub const KT256 = KTHash(KT256Variant, turboSHAKE256MultiSliceToBuffer);
+
+test "KT128 sequential and parallel produce same output for small inputs" {
+    const allocator = std.testing.allocator;
+
+    // Test with different small input sizes
+    const test_sizes = [_]usize{ 100, 1024, 4096, 8192 }; // 100B, 1KB, 4KB, 8KB
+
+    for (test_sizes) |size| {
+        const input = try allocator.alloc(u8, size);
+        defer allocator.free(input);
+
+        // Fill with random data
+        std.crypto.random.bytes(input);
+
+        var output_seq: [32]u8 = undefined;
+        var output_par: [32]u8 = undefined;
+
+        // Hash with sequential method
+        try KT128.hash(input, null, &output_seq);
+
+        // Hash with parallel method
+        try KT128.hashParallel(input, null, &output_par, allocator);
+
+        // Verify outputs match
+        try std.testing.expectEqualSlices(u8, &output_seq, &output_par);
+    }
+}
+
+test "KT128 sequential and parallel produce same output for large inputs" {
+    const allocator = std.testing.allocator;
+
+    // Test with large input sizes that trigger parallel processing
+    // The threshold is 3-10MB depending on CPU count, so we test above that
+    const test_sizes = [_]usize{ 11 * 1024 * 1024, 20 * 1024 * 1024 }; // 11MB, 20MB
+
+    for (test_sizes) |size| {
+        const input = try allocator.alloc(u8, size);
+        defer allocator.free(input);
+
+        // Fill with random data
+        std.crypto.random.bytes(input);
+
+        var output_seq: [64]u8 = undefined;
+        var output_par: [64]u8 = undefined;
+
+        // Hash with sequential method
+        try KT128.hash(input, null, &output_seq);
+
+        // Hash with parallel method
+        try KT128.hashParallel(input, null, &output_par, allocator);
+
+        // Verify outputs match
+        try std.testing.expectEqualSlices(u8, &output_seq, &output_par);
+    }
+}
+
+test "KT128 sequential and parallel produce same output with customization" {
+    const allocator = std.testing.allocator;
+
+    const input_size = 15 * 1024 * 1024; // 15MB
+    const input = try allocator.alloc(u8, input_size);
+    defer allocator.free(input);
+
+    // Fill with random data
+    std.crypto.random.bytes(input);
+
+    const customization = "test domain";
+    var output_seq: [48]u8 = undefined;
+    var output_par: [48]u8 = undefined;
+
+    // Hash with sequential method
+    try KT128.hash(input, customization, &output_seq);
+
+    // Hash with parallel method
+    try KT128.hashParallel(input, customization, &output_par, allocator);
+
+    // Verify outputs match
+    try std.testing.expectEqualSlices(u8, &output_seq, &output_par);
+}
+
+test "KT256 sequential and parallel produce same output for small inputs" {
+    const allocator = std.testing.allocator;
+
+    // Test with different small input sizes
+    const test_sizes = [_]usize{ 100, 1024, 4096, 8192 }; // 100B, 1KB, 4KB, 8KB
+
+    for (test_sizes) |size| {
+        const input = try allocator.alloc(u8, size);
+        defer allocator.free(input);
+
+        // Fill with random data
+        std.crypto.random.bytes(input);
+
+        var output_seq: [64]u8 = undefined;
+        var output_par: [64]u8 = undefined;
+
+        // Hash with sequential method
+        try KT256.hash(input, null, &output_seq);
+
+        // Hash with parallel method
+        try KT256.hashParallel(input, null, &output_par, allocator);
+
+        // Verify outputs match
+        try std.testing.expectEqualSlices(u8, &output_seq, &output_par);
+    }
+}
+
+test "KT256 sequential and parallel produce same output for large inputs" {
+    const allocator = std.testing.allocator;
+
+    // Test with large input sizes that trigger parallel processing
+    const test_sizes = [_]usize{ 11 * 1024 * 1024, 20 * 1024 * 1024 }; // 11MB, 20MB
+
+    for (test_sizes) |size| {
+        const input = try allocator.alloc(u8, size);
+        defer allocator.free(input);
+
+        // Fill with random data
+        std.crypto.random.bytes(input);
+
+        var output_seq: [64]u8 = undefined;
+        var output_par: [64]u8 = undefined;
+
+        // Hash with sequential method
+        try KT256.hash(input, null, &output_seq);
+
+        // Hash with parallel method
+        try KT256.hashParallel(input, null, &output_par, allocator);
+
+        // Verify outputs match
+        try std.testing.expectEqualSlices(u8, &output_seq, &output_par);
+    }
+}
+
+test "KT256 sequential and parallel produce same output with customization" {
+    const allocator = std.testing.allocator;
+
+    const input_size = 15 * 1024 * 1024; // 15MB
+    const input = try allocator.alloc(u8, input_size);
+    defer allocator.free(input);
+
+    // Fill with random data
+    std.crypto.random.bytes(input);
+
+    const customization = "test domain";
+    var output_seq: [80]u8 = undefined;
+    var output_par: [80]u8 = undefined;
+
+    // Hash with sequential method
+    try KT256.hash(input, customization, &output_seq);
+
+    // Hash with parallel method
+    try KT256.hashParallel(input, customization, &output_par, allocator);
+
+    // Verify outputs match
+    try std.testing.expectEqualSlices(u8, &output_seq, &output_par);
+}
+
+/// Helper: Generate pattern data where data[i] = (i % 251)
+fn generatePattern(allocator: std.mem.Allocator, len: usize) ![]u8 {
+    const data = try allocator.alloc(u8, len);
+    for (data, 0..) |*byte, i| {
+        byte.* = @intCast(i % 251);
+    }
+    return data;
+}
+
+test "KT128: empty message, empty customization, 32 bytes" {
+    var output: [32]u8 = undefined;
+    try KT128.hash(&[_]u8{}, null, &output);
+
+    var expected: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "1AC2D450FC3B4205D19DA7BFCA1B37513C0803577AC7167F06FE2CE1F0EF39E5");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT128: empty message, empty customization, 64 bytes" {
+    var output: [64]u8 = undefined;
+    try KT128.hash(&[_]u8{}, null, &output);
+
+    var expected: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "1AC2D450FC3B4205D19DA7BFCA1B37513C0803577AC7167F06FE2CE1F0EF39E54269C056B8C82E48276038B6D292966CC07A3D4645272E31FF38508139EB0A71");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT128: empty message, empty customization, 10032 bytes (last 32)" {
+    const allocator = std.testing.allocator;
+    const output = try allocator.alloc(u8, 10032);
+    defer allocator.free(output);
+
+    try KT128.hash(&[_]u8{}, null, output);
+
+    var expected: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "E8DC563642F7228C84684C898405D3A834799158C079B12880277A1D28E2FF6D");
+    try std.testing.expectEqualSlices(u8, &expected, output[10000..]);
+}
+
+test "KT128: pattern message (1 byte), empty customization, 32 bytes" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 1);
+    defer allocator.free(message);
+
+    var output: [32]u8 = undefined;
+    try KT128.hash(message, null, &output);
+
+    var expected: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "2BDA92450E8B147F8A7CB629E784A058EFCA7CF7D8218E02D345DFAA65244A1F");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT128: pattern message (17 bytes), empty customization, 32 bytes" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 17);
+    defer allocator.free(message);
+
+    var output: [32]u8 = undefined;
+    try KT128.hash(message, null, &output);
+
+    var expected: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "6BF75FA2239198DB4772E36478F8E19B0F371205F6A9A93A273F51DF37122888");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT128: pattern message (289 bytes), empty customization, 32 bytes" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 289);
+    defer allocator.free(message);
+
+    var output: [32]u8 = undefined;
+    try KT128.hash(message, null, &output);
+
+    var expected: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "0C315EBCDEDBF61426DE7DCF8FB725D1E74675D7F5327A5067F367B108ECB67C");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT128: 0xFF message (1 byte), pattern customization (1 byte), 32 bytes" {
+    const allocator = std.testing.allocator;
+    const customization = try generatePattern(allocator, 1);
+    defer allocator.free(customization);
+
+    const message = [_]u8{0xFF};
+    var output: [32]u8 = undefined;
+    try KT128.hash(&message, customization, &output);
+
+    var expected: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "A20B92B251E3D62443EC286E4B9B470A4E8315C156EEB24878B038ABE20650BE");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT128: pattern message (8191 bytes), empty customization, 32 bytes" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 8191);
+    defer allocator.free(message);
+
+    var output: [32]u8 = undefined;
+    try KT128.hash(message, null, &output);
+
+    var expected: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "1B577636F723643E990CC7D6A659837436FD6A103626600EB8301CD1DBE553D6");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT128: pattern message (8192 bytes), empty customization, 32 bytes" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 8192);
+    defer allocator.free(message);
+
+    var output: [32]u8 = undefined;
+    try KT128.hash(message, null, &output);
+
+    var expected: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "48F256F6772F9EDFB6A8B661EC92DC93B95EBD05A08A17B39AE3490870C926C3");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT256: empty message, empty customization, 64 bytes" {
+    var output: [64]u8 = undefined;
+    try KT256.hash(&[_]u8{}, null, &output);
+
+    var expected: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "B23D2E9CEA9F4904E02BEC06817FC10CE38CE8E93EF4C89E6537076AF8646404E3E8B68107B8833A5D30490AA33482353FD4ADC7148ECB782855003AAEBDE4A9");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT256: empty message, empty customization, 128 bytes" {
+    var output: [128]u8 = undefined;
+    try KT256.hash(&[_]u8{}, null, &output);
+
+    var expected: [128]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "B23D2E9CEA9F4904E02BEC06817FC10CE38CE8E93EF4C89E6537076AF8646404E3E8B68107B8833A5D30490AA33482353FD4ADC7148ECB782855003AAEBDE4A9B0925319D8EA1E121A609821EC19EFEA89E6D08DAEE1662B69C840289F188BA860F55760B61F82114C030C97E5178449608CCD2CD2D919FC7829FF69931AC4D0");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT256: pattern message (1 byte), empty customization, 64 bytes" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 1);
+    defer allocator.free(message);
+
+    var output: [64]u8 = undefined;
+    try KT256.hash(message, null, &output);
+
+    var expected: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "0D005A194085360217128CF17F91E1F71314EFA5564539D444912E3437EFA17F82DB6F6FFE76E781EAA068BCE01F2BBF81EACB983D7230F2FB02834A21B1DDD0");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT256: pattern message (17 bytes), empty customization, 64 bytes" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 17);
+    defer allocator.free(message);
+
+    var output: [64]u8 = undefined;
+    try KT256.hash(message, null, &output);
+
+    var expected: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "1BA3C02B1FC514474F06C8979978A9056C8483F4A1B63D0DCCEFE3A28A2F323E1CDCCA40EBF006AC76EF0397152346837B1277D3E7FAA9C9653B19075098527B");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT256: pattern message (8191 bytes), empty customization, 64 bytes" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 8191);
+    defer allocator.free(message);
+
+    var output: [64]u8 = undefined;
+    try KT256.hash(message, null, &output);
+
+    var expected: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "3081434D93A4108D8D8A3305B89682CEBEDC7CA4EA8A3CE869FBB73CBE4A58EEF6F24DE38FFC170514C70E7AB2D01F03812616E863D769AFB3753193BA045B20");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT256: pattern message (8192 bytes), empty customization, 64 bytes" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 8192);
+    defer allocator.free(message);
+
+    var output: [64]u8 = undefined;
+    try KT256.hash(message, null, &output);
+
+    var expected: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "C6EE8E2AD3200C018AC87AAA031CDAC22121B412D07DC6E0DCCBB53423747E9A1C18834D99DF596CF0CF4B8DFAFB7BF02D139D0C9035725ADC1A01B7230A41FA");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT128: pattern message (8193 bytes), empty customization, 32 bytes" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 8193);
+    defer allocator.free(message);
+
+    var output: [32]u8 = undefined;
+    try KT128.hash(message, null, &output);
+
+    var expected: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "BB66FE72EAEA5179418D5295EE1344854D8AD7F3FA17EFCB467EC152341284CF");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT128: pattern message (16384 bytes), empty customization, 32 bytes" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 16384);
+    defer allocator.free(message);
+
+    var output: [32]u8 = undefined;
+    try KT128.hash(message, null, &output);
+
+    var expected: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "82778F7F7234C83352E76837B721FBDBB5270B88010D84FA5AB0B61EC8CE0956");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT128: pattern message (16385 bytes), empty customization, 32 bytes" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 16385);
+    defer allocator.free(message);
+
+    var output: [32]u8 = undefined;
+    try KT128.hash(message, null, &output);
+
+    var expected: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "5F8D2B943922B451842B4E82740D02369E2D5F9F33C5123509A53B955FE177B2");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT256: pattern message (8193 bytes), empty customization, 64 bytes" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 8193);
+    defer allocator.free(message);
+
+    var output: [64]u8 = undefined;
+    try KT256.hash(message, null, &output);
+
+    var expected: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "65FF03335900E5197ACBD5F41B797F0E7E36AD4FF7D89C09FA6F28AE58D1E8BC2DF1779B86F988C3B13690172914EA172423B23EF4057255BB0836AB3A99836E");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT256: pattern message (16384 bytes), empty customization, 64 bytes" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 16384);
+    defer allocator.free(message);
+
+    var output: [64]u8 = undefined;
+    try KT256.hash(message, null, &output);
+
+    var expected: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "74604239A14847CB79069B4FF0E51070A93034C9AC4DFF4D45E0F2C5DA81D930DE6055C2134B4DF4E49F27D1B2C66E95491858B182A924BD0504DA5976BC516D");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "KT256: pattern message (16385 bytes), empty customization, 64 bytes" {
+    const allocator = std.testing.allocator;
+    const message = try generatePattern(allocator, 16385);
+    defer allocator.free(message);
+
+    var output: [64]u8 = undefined;
+    try KT256.hash(message, null, &output);
+
+    var expected: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "C814F23132DADBFD55379F18CB988CB39B751F119322823FD982644A897485397B9F40EB11C6E416359B8AE695A5CE0FA79D1ADA1EEC745D82E0A5AB08A9F014");
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
