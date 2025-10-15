@@ -66,7 +66,12 @@ fn KangarooVariant(
             toBufferFn(view, separation_byte, output);
         }
 
-        inline fn turboSHAKEMultiSliceAlloc(allocator: Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
+        inline fn turboSHAKEMultiSliceAlloc(
+            allocator: Allocator,
+            view: *const MultiSliceView,
+            separation_byte: u8,
+            output_len: usize,
+        ) ![]u8 {
             return allocFn(allocator, view, separation_byte, output_len);
         }
     };
@@ -286,7 +291,13 @@ fn keccakP1600timesN(comptime N: usize, states: *[5][5]@Vector(N, u64)) void {
 }
 
 /// Add lanes from data to N states in parallel with stride - optimized version
-fn addLanesAll(comptime N: usize, states: *[5][5]@Vector(N, u64), data: []const u8, lane_count: usize, lane_offset: usize) void {
+fn addLanesAll(
+    comptime N: usize,
+    states: *[5][5]@Vector(N, u64),
+    data: []const u8,
+    lane_count: usize,
+    lane_offset: usize,
+) void {
     assert(data.len >= 8 * ((N - 1) * lane_offset + lane_count));
 
     // Process lanes (at most 25 lanes in Keccak state)
@@ -419,7 +430,12 @@ fn keccakPLanes(lanes: *[25]u64) void {
 }
 
 /// Generic non-allocating TurboSHAKE: write output to provided buffer
-fn turboSHAKEMultiSliceToBuffer(comptime rate: usize, view: *const MultiSliceView, separation_byte: u8, output: []u8) void {
+fn turboSHAKEMultiSliceToBuffer(
+    comptime rate: usize,
+    view: *const MultiSliceView,
+    separation_byte: u8,
+    output: []u8,
+) void {
     var state: [200]u8 = @splat(0);
     var state_pos: usize = 0;
 
@@ -455,29 +471,53 @@ fn turboSHAKEMultiSliceToBuffer(comptime rate: usize, view: *const MultiSliceVie
 }
 
 /// Generic allocating TurboSHAKE
-fn turboSHAKEMultiSlice(comptime rate: usize, allocator: Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
+fn turboSHAKEMultiSlice(
+    comptime rate: usize,
+    allocator: Allocator,
+    view: *const MultiSliceView,
+    separation_byte: u8,
+    output_len: usize,
+) ![]u8 {
     const output = try allocator.alloc(u8, output_len);
     turboSHAKEMultiSliceToBuffer(rate, view, separation_byte, output);
     return output;
 }
 
 /// Non-allocating TurboSHAKE128: write output to provided buffer
-fn turboSHAKE128MultiSliceToBuffer(view: *const MultiSliceView, separation_byte: u8, output: []u8) void {
+fn turboSHAKE128MultiSliceToBuffer(
+    view: *const MultiSliceView,
+    separation_byte: u8,
+    output: []u8,
+) void {
     turboSHAKEMultiSliceToBuffer(168, view, separation_byte, output);
 }
 
 /// Allocating TurboSHAKE128
-fn turboSHAKE128MultiSlice(allocator: Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
+fn turboSHAKE128MultiSlice(
+    allocator: Allocator,
+    view: *const MultiSliceView,
+    separation_byte: u8,
+    output_len: usize,
+) ![]u8 {
     return turboSHAKEMultiSlice(168, allocator, view, separation_byte, output_len);
 }
 
 /// Non-allocating TurboSHAKE256: write output to provided buffer
-fn turboSHAKE256MultiSliceToBuffer(view: *const MultiSliceView, separation_byte: u8, output: []u8) void {
+fn turboSHAKE256MultiSliceToBuffer(
+    view: *const MultiSliceView,
+    separation_byte: u8,
+    output: []u8,
+) void {
     turboSHAKEMultiSliceToBuffer(136, view, separation_byte, output);
 }
 
 /// Allocating TurboSHAKE256
-fn turboSHAKE256MultiSlice(allocator: Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
+fn turboSHAKE256MultiSlice(
+    allocator: Allocator,
+    view: *const MultiSliceView,
+    separation_byte: u8,
+    output_len: usize,
+) ![]u8 {
     return turboSHAKEMultiSlice(136, allocator, view, separation_byte, output_len);
 }
 
@@ -490,7 +530,12 @@ const TurboSHAKE128State = crypto.hash.sha3.TurboShake128(0x06);
 const TurboSHAKE256State = crypto.hash.sha3.TurboShake256(0x06);
 
 /// Process N leaves (8KiB chunks) in parallel - generic version
-fn processLeaves(comptime Variant: type, comptime N: usize, data: []const u8, result: *[N * Variant.cv_size]u8) void {
+fn processLeaves(
+    comptime Variant: type,
+    comptime N: usize,
+    data: []const u8,
+    result: *[N * Variant.cv_size]u8,
+) void {
     assert(data.len >= N * chunk_size);
 
     const rate_in_lanes: usize = Variant.rate_in_lanes;
@@ -697,7 +742,13 @@ fn ktSingleThreaded(comptime Variant: type, view: *const MultiSliceView, total_l
 }
 
 /// Generic multi-threaded implementation
-fn ktMultiThreaded(comptime Variant: type, allocator: Allocator, view: *const MultiSliceView, total_len: usize, output: []u8) !void {
+fn ktMultiThreaded(
+    comptime Variant: type,
+    allocator: Allocator,
+    view: *const MultiSliceView,
+    total_len: usize,
+    output: []u8,
+) !void {
     const cv_size = Variant.cv_size;
 
     // Calculate total number of leaves
