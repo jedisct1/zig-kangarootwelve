@@ -4,10 +4,6 @@ const Thread = std.Thread;
 const Pool = Thread.Pool;
 const WaitGroup = Thread.WaitGroup;
 
-// ============================================================================
-// Constants
-// ============================================================================
-
 const B: usize = 8192; // Chunk size for tree hashing (8 KiB)
 const CACHE_LINE_SIZE = 64; // Common cache line size for x86_64 and ARM
 
@@ -41,10 +37,6 @@ const RC = [12]u64{
     0x0000000080000001,
     0x8000000080008008,
 };
-
-// ============================================================================
-// KangarooTwelve variant configuration
-// ============================================================================
 
 /// KangarooTwelve with 128-bit security parameters
 const KT128Variant = struct {
@@ -81,10 +73,6 @@ const KT256Variant = struct {
         return turboSHAKE256MultiSlice(allocator, view, separation_byte, output_len);
     }
 };
-
-// ============================================================================
-// Core SIMD utilities
-// ============================================================================
 
 /// Rotate left for u64 vector
 inline fn rol64Vec(comptime N: usize, v: @Vector(N, u64), comptime n: u6) @Vector(N, u64) {
@@ -146,10 +134,6 @@ fn rightEncode(x: usize) RightEncoded {
     return result;
 }
 
-// ============================================================================
-// Multi-slice view for zero-copy processing
-// ============================================================================
-
 /// Virtual contiguous view over multiple slices (zero-copy)
 const MultiSliceView = struct {
     slices: [3][]const u8,
@@ -202,10 +186,6 @@ const MultiSliceView = struct {
         }
     }
 };
-
-// ============================================================================
-// Keccak-p[1600,12] SIMD permutation
-// ============================================================================
 
 /// Apply Keccak-p[1600,12] to N states in parallel - optimized version
 fn keccakP1600timesN(comptime N: usize, states: *[5][5]@Vector(N, u64)) void {
@@ -502,10 +482,6 @@ fn turboSHAKE256MultiSlice(allocator: std.mem.Allocator, view: *const MultiSlice
     return turboSHAKEMultiSlice(136, allocator, view, separation_byte, output_len);
 }
 
-// ============================================================================
-// Streaming TurboSHAKE state structures for incremental absorption
-// ============================================================================
-
 /// Generic streaming TurboSHAKE state for incremental hashing
 fn TurboSHAKEState(comptime rate: usize) type {
     return struct {
@@ -604,15 +580,15 @@ fn TurboSHAKEState(comptime rate: usize) type {
     };
 }
 
-/// Streaming TurboSHAKE128 state for incremental hashing
+/// Streaming TurboSHAKE128 state for incremental hashing.
+/// Allows processing data in chunks without buffering everything in memory.
+/// Usage: init() -> update() (multiple times) -> finalize().
 pub const TurboSHAKE128State = TurboSHAKEState(168);
 
-/// Streaming TurboSHAKE256 state for incremental hashing
+/// Streaming TurboSHAKE256 state for incremental hashing.
+/// Allows processing data in chunks without buffering everything in memory.
+/// Usage: init() -> update() (multiple times) -> finalize().
 pub const TurboSHAKE256State = TurboSHAKEState(136);
-
-// ============================================================================
-// SIMD leaf processing
-// ============================================================================
 
 /// Process N leaves (8KiB chunks) in parallel - generic version
 fn processLeaves(comptime Variant: type, comptime N: usize, data: []const u8, result: *[N * Variant.cv_size]u8) void {
@@ -665,10 +641,6 @@ fn processLeaves(comptime Variant: type, comptime N: usize, data: []const u8, re
         }
     }
 }
-
-// ============================================================================
-// Thread-level leaf processing (for large files)
-// ============================================================================
 
 /// Context for processing a batch of leaves in a thread
 const LeafBatchContext = struct {
@@ -776,10 +748,6 @@ fn processLeafBatch(ctx: LeafBatchContext) void {
     }
 }
 
-// ============================================================================
-// Single-threaded implementation (for small/medium files)
-// ============================================================================
-
 /// Generic single-threaded implementation
 fn ktSingleThreaded(comptime Variant: type, view: *const MultiSliceView, total_len: usize, output: []u8) void {
     const cv_size = Variant.cv_size;
@@ -883,10 +851,6 @@ fn ktSingleThreaded(comptime Variant: type, view: *const MultiSliceView, total_l
     final_state.finalize(0x06, output);
 }
 
-// ============================================================================
-// Multi-threaded implementation (for large files ≥ 50 MB)
-// ============================================================================
-
 /// Generic multi-threaded implementation
 fn ktMultiThreaded(comptime Variant: type, allocator: std.mem.Allocator, view: *const MultiSliceView, total_len: usize, output_len: usize) ![]u8 {
     const cv_size = Variant.cv_size;
@@ -971,14 +935,16 @@ fn ktMultiThreaded(comptime Variant: type, allocator: std.mem.Allocator, view: *
     return Variant.turboSHAKEMultiSliceAlloc(allocator, &final_view, 0x06, output_len);
 }
 
-// ============================================================================
-// Main public API
-// ============================================================================
-
-/// KangarooTwelve with 128-bit security (KT128)
+/// KangarooTwelve with 128-bit security (based on TurboSHAKE128).
+/// Provides 128-bit collision and preimage resistance.
 pub const KT128 = struct {
-    /// Single-threaded hash computation
-    /// Writes output to provided buffer (no allocation)
+    /// Hash a message using sequential processing with SIMD acceleration.
+    /// Best performance for inputs under 10MB. Never allocates memory.
+    ///
+    /// Parameters:
+    ///   - message: Input data to hash (any length)
+    ///   - customization: Optional domain separation string (or null)
+    ///   - out: Output buffer (any length, arbitrary output sizes supported)
     pub fn hash(message: []const u8, customization: ?[]const u8, out: []u8) !void {
         const custom = customization orelse &[_]u8{};
 
@@ -999,8 +965,9 @@ pub const KT128 = struct {
         ktSingleThreaded(KT128Variant, &view, total_len, out);
     }
 
-    /// Multi-threaded hash computation for large inputs
-    /// Writes output to provided buffer (requires allocator for internal work)
+    /// Hash with automatic parallelization for large inputs (>3-10MB depending on CPU count).
+    /// Automatically uses sequential processing for smaller inputs to avoid thread overhead.
+    /// Allocator required for thread pool and temporary buffers.
     pub fn hashParallel(message: []const u8, customization: ?[]const u8, out: []u8, allocator: std.mem.Allocator) !void {
         const custom = customization orelse &[_]u8{};
 
@@ -1028,10 +995,18 @@ pub const KT128 = struct {
     }
 };
 
-/// KangarooTwelve with 256-bit security (KT256)
+/// KangarooTwelve with 256-bit security (based on TurboSHAKE256).
+/// Provides 256-bit collision and preimage resistance. Use when you need
+/// post-quantum security (NIST level 2) or extra conservative margins.
+/// For most applications, KT128 offers better performance with adequate security.
 pub const KT256 = struct {
-    /// Single-threaded hash computation
-    /// Writes output to provided buffer (no allocation)
+    /// Hash a message using sequential processing with SIMD acceleration.
+    /// Best performance for inputs under 10MB. Never allocates memory.
+    ///
+    /// Parameters:
+    ///   - message: Input data to hash (any length)
+    ///   - customization: Optional domain separation string (or null)
+    ///   - out: Output buffer (any length, arbitrary output sizes supported)
     pub fn hash(message: []const u8, customization: ?[]const u8, out: []u8) !void {
         const custom = customization orelse &[_]u8{};
 
@@ -1047,8 +1022,9 @@ pub const KT256 = struct {
         ktSingleThreaded(KT256Variant, &view, total_len, out);
     }
 
-    /// Multi-threaded hash computation for large inputs
-    /// Writes output to provided buffer (requires allocator for internal work)
+    /// Hash with automatic parallelization for large inputs (>3-10MB depending on CPU count).
+    /// Automatically uses sequential processing for smaller inputs to avoid thread overhead.
+    /// Allocator required for thread pool and temporary buffers.
     pub fn hashParallel(message: []const u8, customization: ?[]const u8, out: []u8, allocator: std.mem.Allocator) !void {
         const custom = customization orelse &[_]u8{};
 
