@@ -235,12 +235,9 @@ fn keccakP1600timesN(comptime N: usize, states: *[5][5]@Vector(N, u64)) void {
         }
 
         var D: [5]@Vector(N, u64) = undefined;
-        // Unrolled computation avoiding modulo operations
-        D[0] = C[4] ^ rol64Vec(N, C[1], 1);
-        D[1] = C[0] ^ rol64Vec(N, C[2], 1);
-        D[2] = C[1] ^ rol64Vec(N, C[3], 1);
-        D[3] = C[2] ^ rol64Vec(N, C[4], 1);
-        D[4] = C[3] ^ rol64Vec(N, C[0], 1);
+        inline for (0..5) |x| {
+            D[x] = C[(x + 4) % 5] ^ rol64Vec(N, C[(x + 1) % 5], 1);
+        }
 
         // Apply D to all lanes
         inline for (0..5) |x| {
@@ -646,9 +643,8 @@ const LeafBatchContext = struct {
     output_cvs: []u8,
     batch_start: usize,
     batch_count: usize,
-    kt_variant: enum { kt128, kt256 },
     view: *const MultiSliceView,
-    scratch_buffer: []u8, // Pre-allocated scratch space (no allocations in worker!)
+    scratch_buffer: []u8, // Pre-allocated scratch space (no allocations in worker)
     total_len: usize, // Total length of input data (for boundary checking)
 };
 
@@ -674,76 +670,62 @@ inline fn processNLeaves(
     }
 }
 
-/// Process a batch of leaves in a single thread using SIMD (NO ALLOCATIONS!)
-fn processLeafBatch(ctx: LeafBatchContext) void {
+/// Process a batch of leaves in a single thread using SIMD
+fn processLeafBatch(comptime Variant: type, ctx: LeafBatchContext) void {
+    const cv_size = Variant.cv_size;
     const leaf_buffer = ctx.scratch_buffer[0 .. 8 * B];
-    const cv_size: usize = if (ctx.kt_variant == .kt128) 32 else 64;
     const cv_scratch = ctx.scratch_buffer[8 * B .. 8 * B + cv_size];
 
     var cvs_offset: usize = 0;
     var j: usize = ctx.batch_start;
     const batch_end = @min(ctx.batch_start + ctx.batch_count * B, ctx.total_len);
 
-    // Process leaves using SIMD (8x, 4x, 2x, 1x) based on optimal vector length
-    while (j < batch_end) {
-        const remaining = batch_end - j;
-
-        if (optimal_vector_len >= 8 and remaining >= 8 * B) {
-            if (ctx.kt_variant == .kt128) {
-                processNLeaves(KT128Variant, 8, ctx.view, j, leaf_buffer, ctx.output_cvs[cvs_offset..]);
-                cvs_offset += 8 * 32;
-            } else {
-                processNLeaves(KT256Variant, 8, ctx.view, j, leaf_buffer, ctx.output_cvs[cvs_offset..]);
-                cvs_offset += 8 * 64;
-            }
-            j += 8 * B;
-        } else if (optimal_vector_len >= 4 and remaining >= 4 * B) {
-            if (ctx.kt_variant == .kt128) {
-                processNLeaves(KT128Variant, 4, ctx.view, j, leaf_buffer, ctx.output_cvs[cvs_offset..]);
-                cvs_offset += 4 * 32;
-            } else {
-                processNLeaves(KT256Variant, 4, ctx.view, j, leaf_buffer, ctx.output_cvs[cvs_offset..]);
-                cvs_offset += 4 * 64;
-            }
-            j += 4 * B;
-        } else if (optimal_vector_len >= 2 and remaining >= 2 * B) {
-            if (ctx.kt_variant == .kt128) {
-                processNLeaves(KT128Variant, 2, ctx.view, j, leaf_buffer, ctx.output_cvs[cvs_offset..]);
-                cvs_offset += 2 * 32;
-            } else {
-                processNLeaves(KT256Variant, 2, ctx.view, j, leaf_buffer, ctx.output_cvs[cvs_offset..]);
-                cvs_offset += 2 * 64;
-            }
-            j += 2 * B;
-        } else {
-            // Process single leaf
-            const chunk_len = @min(B, batch_end - j);
-            if (ctx.view.tryGetSlice(j, j + chunk_len)) |leaf_data| {
-                const cv_slice = MultiSliceView.init(leaf_data, &[_]u8{}, &[_]u8{});
-                if (ctx.kt_variant == .kt128) {
-                    turboSHAKE128MultiSliceToBuffer(&cv_slice, 0x0B, cv_scratch[0..32]);
-                    @memcpy(ctx.output_cvs[cvs_offset..][0..32], cv_scratch[0..32]);
-                    cvs_offset += 32;
-                } else {
-                    turboSHAKE256MultiSliceToBuffer(&cv_slice, 0x0B, cv_scratch[0..64]);
-                    @memcpy(ctx.output_cvs[cvs_offset..][0..64], cv_scratch[0..64]);
-                    cvs_offset += 64;
-                }
-            } else {
-                ctx.view.copyRange(j, j + chunk_len, leaf_buffer[0..chunk_len]);
-                const cv_slice = MultiSliceView.init(leaf_buffer[0..chunk_len], &[_]u8{}, &[_]u8{});
-                if (ctx.kt_variant == .kt128) {
-                    turboSHAKE128MultiSliceToBuffer(&cv_slice, 0x0B, cv_scratch[0..32]);
-                    @memcpy(ctx.output_cvs[cvs_offset..][0..32], cv_scratch[0..32]);
-                    cvs_offset += 32;
-                } else {
-                    turboSHAKE256MultiSliceToBuffer(&cv_slice, 0x0B, cv_scratch[0..64]);
-                    @memcpy(ctx.output_cvs[cvs_offset..][0..64], cv_scratch[0..64]);
-                    cvs_offset += 64;
-                }
-            }
-            j += B;
+    // Process leaves using SIMD (8x, 4x, 2x) based on optimal vector length
+    inline for ([_]usize{ 8, 4, 2 }) |batch_size| {
+        while (optimal_vector_len >= batch_size and j + batch_size * B <= batch_end) {
+            processNLeaves(Variant, batch_size, ctx.view, j, leaf_buffer, ctx.output_cvs[cvs_offset..]);
+            cvs_offset += batch_size * cv_size;
+            j += batch_size * B;
         }
+    }
+
+    // Process remaining single leaves
+    while (j < batch_end) {
+        const chunk_len = @min(B, batch_end - j);
+        if (ctx.view.tryGetSlice(j, j + chunk_len)) |leaf_data| {
+            const cv_slice = MultiSliceView.init(leaf_data, &[_]u8{}, &[_]u8{});
+            Variant.turboSHAKEToBuffer(&cv_slice, 0x0B, cv_scratch[0..cv_size]);
+            @memcpy(ctx.output_cvs[cvs_offset..][0..cv_size], cv_scratch[0..cv_size]);
+        } else {
+            ctx.view.copyRange(j, j + chunk_len, leaf_buffer[0..chunk_len]);
+            const cv_slice = MultiSliceView.init(leaf_buffer[0..chunk_len], &[_]u8{}, &[_]u8{});
+            Variant.turboSHAKEToBuffer(&cv_slice, 0x0B, cv_scratch[0..cv_size]);
+            @memcpy(ctx.output_cvs[cvs_offset..][0..cv_size], cv_scratch[0..cv_size]);
+        }
+        cvs_offset += cv_size;
+        j += B;
+    }
+}
+
+/// Helper to process N leaves in SIMD and absorb CVs into state
+inline fn processAndAbsorbNLeaves(
+    comptime Variant: type,
+    comptime N: usize,
+    view: *const MultiSliceView,
+    j: usize,
+    leaf_buffer: []u8,
+    final_state: anytype,
+) void {
+    const cv_size = Variant.cv_size;
+    if (view.tryGetSlice(j, j + N * B)) |leaf_data| {
+        var leaf_cvs: [N * cv_size]u8 align(CACHE_LINE_SIZE) = undefined;
+        processLeaves(Variant, N, leaf_data, &leaf_cvs);
+        final_state.update(&leaf_cvs);
+    } else {
+        view.copyRange(j, j + N * B, leaf_buffer[0 .. N * B]);
+        var leaf_cvs: [N * cv_size]u8 align(CACHE_LINE_SIZE) = undefined;
+        processLeaves(Variant, N, leaf_buffer[0 .. N * B], &leaf_cvs);
+        final_state.update(&leaf_cvs);
     }
 }
 
@@ -775,52 +757,13 @@ fn ktSingleThreaded(comptime Variant: type, view: *const MultiSliceView, total_l
     var leaf_buffer: [B * 8]u8 align(CACHE_LINE_SIZE) = undefined;
     var cv_buffer: [64]u8 = undefined; // Max CV size is 64 bytes
 
-    // Process 8 leaves in parallel (if optimal for this platform)
-    while (optimal_vector_len >= 8 and j + 8 * B <= total_len) {
-        if (view.tryGetSlice(j, j + 8 * B)) |leaf_data| {
-            var leaf_cvs: [8 * cv_size]u8 align(CACHE_LINE_SIZE) = undefined;
-            processLeaves(Variant, 8, leaf_data, &leaf_cvs);
-            final_state.update(&leaf_cvs); // Absorb all 8 CVs at once
-        } else {
-            view.copyRange(j, j + 8 * B, leaf_buffer[0 .. 8 * B]);
-            var leaf_cvs: [8 * cv_size]u8 align(CACHE_LINE_SIZE) = undefined;
-            processLeaves(Variant, 8, leaf_buffer[0 .. 8 * B], &leaf_cvs);
-            final_state.update(&leaf_cvs);
+    // Process leaves in SIMD batches (8x, 4x, 2x)
+    inline for ([_]usize{ 8, 4, 2 }) |batch_size| {
+        while (optimal_vector_len >= batch_size and j + batch_size * B <= total_len) {
+            processAndAbsorbNLeaves(Variant, batch_size, view, j, &leaf_buffer, &final_state);
+            j += batch_size * B;
+            n += batch_size;
         }
-        j += 8 * B;
-        n += 8;
-    }
-
-    // Process 4 leaves in parallel (if optimal for this platform)
-    while (optimal_vector_len >= 4 and j + 4 * B <= total_len) {
-        if (view.tryGetSlice(j, j + 4 * B)) |leaf_data| {
-            var leaf_cvs: [4 * cv_size]u8 align(CACHE_LINE_SIZE) = undefined;
-            processLeaves(Variant, 4, leaf_data, &leaf_cvs);
-            final_state.update(&leaf_cvs);
-        } else {
-            view.copyRange(j, j + 4 * B, leaf_buffer[0 .. 4 * B]);
-            var leaf_cvs: [4 * cv_size]u8 align(CACHE_LINE_SIZE) = undefined;
-            processLeaves(Variant, 4, leaf_buffer[0 .. 4 * B], &leaf_cvs);
-            final_state.update(&leaf_cvs);
-        }
-        j += 4 * B;
-        n += 4;
-    }
-
-    // Process 2 leaves in parallel (if optimal for this platform)
-    while (optimal_vector_len >= 2 and j + 2 * B <= total_len) {
-        if (view.tryGetSlice(j, j + 2 * B)) |leaf_data| {
-            var leaf_cvs: [2 * cv_size]u8 align(CACHE_LINE_SIZE) = undefined;
-            processLeaves(Variant, 2, leaf_data, &leaf_cvs);
-            final_state.update(&leaf_cvs);
-        } else {
-            view.copyRange(j, j + 2 * B, leaf_buffer[0 .. 2 * B]);
-            var leaf_cvs: [2 * cv_size]u8 align(CACHE_LINE_SIZE) = undefined;
-            processLeaves(Variant, 2, leaf_buffer[0 .. 2 * B], &leaf_cvs);
-            final_state.update(&leaf_cvs);
-        }
-        j += 2 * B;
-        n += 2;
     }
 
     // Process remaining leaves one at a time
@@ -894,13 +837,12 @@ fn ktMultiThreaded(comptime Variant: type, allocator: std.mem.Allocator, view: *
             .output_cvs = cvs[cvs_offset .. cvs_offset + batch_count * cv_size],
             .batch_start = batch_start,
             .batch_count = batch_count,
-            .kt_variant = if (Variant == KT128Variant) .kt128 else .kt256,
             .view = view,
             .scratch_buffer = all_scratch[thread_idx * scratch_size .. (thread_idx + 1) * scratch_size],
             .total_len = total_len,
         };
 
-        pool.spawnWg(&wait_group, processLeafBatch, .{ctx});
+        pool.spawnWg(&wait_group, processLeafBatch, .{ Variant, ctx });
 
         leaves_assigned += batch_count;
         thread_idx += 1;
@@ -950,10 +892,10 @@ fn KTHash(
         pub fn hash(message: []const u8, customization: ?[]const u8, out: []u8) !void {
             const custom = customization orelse &[_]u8{};
 
-            // Right-encode customization length (stack-allocated, no heap!)
+            // Right-encode customization length (stack-allocated)
             const custom_len_enc = rightEncode(custom.len);
 
-            // Create zero-copy multi-slice view (no concatenation!)
+            // Create zero-copy multi-slice view (no concatenation)
             const view = MultiSliceView.init(message, custom, custom_len_enc.slice());
             const total_len = view.totalLen();
 
