@@ -1,12 +1,12 @@
 # KangarooTwelve for Zig
 
-A pure Zig implementation of the KangarooTwelve (K12) cryptographic hash function with support for both sequential and parallel processing.
+A pure Zig implementation of the KangarooTwelve (K12, RFC9861) cryptographic hash function with support for both sequential and parallel processing.
 
 ## About KangarooTwelve
 
 KangarooTwelve is a fast, secure cryptographic hash function based on Keccak (SHA-3). It uses a tree-hashing mode on top of TurboSHAKE, providing both high security and excellent performance, especially on large inputs. K12 supports arbitrary-length output and optional customization strings.
 
-This implementation provides both KT128 (based on TurboSHAKE128) and KT256 (based on TurboSHAKE256).
+This implementation follows the specification from [RFC9861](https://www.rfc-editor.org/info/rfc9861) and provides both KT128 (based on TurboSHAKE128) and KT256 (based on TurboSHAKE256).
 
 ## Installation
 
@@ -152,7 +152,3 @@ Build with optimizations:
 ```bash
 zig build -Doptimize=ReleaseFast
 ```
-
-## References
-
-- [RFC9861 - KangarooTwelve and TurboSHAKE](https://www.rfc-editor.org/info/rfc9861)
