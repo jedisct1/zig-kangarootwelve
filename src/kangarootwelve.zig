@@ -5,7 +5,7 @@ const Pool = Thread.Pool;
 const WaitGroup = Thread.WaitGroup;
 
 const B: usize = 8192; // Chunk size for tree hashing (8 KiB)
-const CACHE_LINE_SIZE = 64; // Common cache line size for x86_64 and ARM
+const CACHE_LINE_SIZE = std.atomic.cache_line;
 
 // Optimal SIMD vector length for u64 on this target platform
 const optimal_vector_len = std.simd.suggestVectorLength(u64) orelse 1;
@@ -208,7 +208,7 @@ const MultiSliceView = struct {
     }
 };
 
-/// Apply Keccak-p[1600,12] to N states in parallel - optimized version
+/// Apply Keccak-p[1600,12] to N states in parallel
 fn keccakP1600timesN(comptime N: usize, states: *[5][5]@Vector(N, u64)) void {
     @setEvalBranchQuota(10000);
 
