@@ -38,41 +38,62 @@ const RC = [12]u64{
     0x8000000080008008,
 };
 
+/// Generic KangarooTwelve variant builder.
+/// Creates a variant type with specific cryptographic parameters.
+fn KangarooVariant(
+    comptime rate_bytes: usize,
+    comptime cv_size_bytes: usize,
+    comptime StateTypeParam: type,
+    comptime sep_x: usize,
+    comptime sep_y: usize,
+    comptime pad_x: usize,
+    comptime pad_y: usize,
+    comptime toBufferFn: fn (*const MultiSliceView, u8, []u8) void,
+    comptime allocFn: fn (std.mem.Allocator, *const MultiSliceView, u8, usize) anyerror![]u8,
+) type {
+    return struct {
+        const rate = rate_bytes;
+        const rate_in_lanes = rate_bytes / 8;
+        const cv_size = cv_size_bytes;
+        const StateType = StateTypeParam;
+        const separation_byte_pos = .{ .x = sep_x, .y = sep_y };
+        const padding_pos = .{ .x = pad_x, .y = pad_y };
+
+        inline fn turboSHAKEToBuffer(view: *const MultiSliceView, separation_byte: u8, output: []u8) void {
+            toBufferFn(view, separation_byte, output);
+        }
+
+        inline fn turboSHAKEMultiSliceAlloc(allocator: std.mem.Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
+            return allocFn(allocator, view, separation_byte, output_len);
+        }
+    };
+}
+
 /// KangarooTwelve with 128-bit security parameters
-const KT128Variant = struct {
-    const rate = 168; // TurboSHAKE128 rate in bytes
-    const rate_in_lanes = 21; // 168 bytes / 8
-    const cv_size = 32; // Chaining value size in bytes
-    const StateType = TurboSHAKE128State;
-    const separation_byte_pos = .{ .x = 1, .y = 3 }; // lane 11 (88 bytes into 168-byte rate)
-    const padding_pos = .{ .x = 0, .y = 4 }; // lane 20 (last lane of 168-byte rate)
-
-    inline fn turboSHAKEToBuffer(view: *const MultiSliceView, separation_byte: u8, output: []u8) void {
-        turboSHAKE128MultiSliceToBuffer(view, separation_byte, output);
-    }
-
-    inline fn turboSHAKEMultiSliceAlloc(allocator: std.mem.Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
-        return turboSHAKE128MultiSlice(allocator, view, separation_byte, output_len);
-    }
-};
+const KT128Variant = KangarooVariant(
+    168, // TurboSHAKE128 rate in bytes
+    32, // Chaining value size in bytes
+    TurboSHAKE128State,
+    1, // separation_byte_pos.x (lane 11: 88 bytes into 168-byte rate)
+    3, // separation_byte_pos.y
+    0, // padding_pos.x (lane 20: last lane of 168-byte rate)
+    4, // padding_pos.y
+    turboSHAKE128MultiSliceToBuffer,
+    turboSHAKE128MultiSlice,
+);
 
 /// KangarooTwelve with 256-bit security parameters
-const KT256Variant = struct {
-    const rate = 136; // TurboSHAKE256 rate in bytes
-    const rate_in_lanes = 17; // 136 bytes / 8
-    const cv_size = 64; // Chaining value size in bytes
-    const StateType = TurboSHAKE256State;
-    const separation_byte_pos = .{ .x = 4, .y = 0 }; // lane 4 (32 bytes into 136-byte rate)
-    const padding_pos = .{ .x = 1, .y = 3 }; // lane 16 (last lane of 136-byte rate)
-
-    inline fn turboSHAKEToBuffer(view: *const MultiSliceView, separation_byte: u8, output: []u8) void {
-        turboSHAKE256MultiSliceToBuffer(view, separation_byte, output);
-    }
-
-    inline fn turboSHAKEMultiSliceAlloc(allocator: std.mem.Allocator, view: *const MultiSliceView, separation_byte: u8, output_len: usize) ![]u8 {
-        return turboSHAKE256MultiSlice(allocator, view, separation_byte, output_len);
-    }
-};
+const KT256Variant = KangarooVariant(
+    136, // TurboSHAKE256 rate in bytes
+    64, // Chaining value size in bytes
+    TurboSHAKE256State,
+    4, // separation_byte_pos.x (lane 4: 32 bytes into 136-byte rate)
+    0, // separation_byte_pos.y
+    1, // padding_pos.x (lane 16: last lane of 136-byte rate)
+    3, // padding_pos.y
+    turboSHAKE256MultiSliceToBuffer,
+    turboSHAKE256MultiSlice,
+);
 
 /// Rotate left for u64 vector
 inline fn rol64Vec(comptime N: usize, v: @Vector(N, u64), comptime n: u6) @Vector(N, u64) {
@@ -934,113 +955,75 @@ fn ktMultiThreaded(comptime Variant: type, allocator: std.mem.Allocator, view: *
     Variant.turboSHAKEToBuffer(&final_view, 0x06, output);
 }
 
+/// Generic KangarooTwelve hash function builder.
+/// Creates a public API type with hash and hashParallel methods for a specific variant.
+fn KTHash(
+    comptime Variant: type,
+    comptime singleChunkFn: fn (*const MultiSliceView, u8, []u8) void,
+) type {
+    return struct {
+        /// Hash a message using sequential processing with SIMD acceleration.
+        /// Best performance for inputs under 10MB. Never allocates memory.
+        ///
+        /// Parameters:
+        ///   - message: Input data to hash (any length)
+        ///   - customization: Optional domain separation string (or null)
+        ///   - out: Output buffer (any length, arbitrary output sizes supported)
+        pub fn hash(message: []const u8, customization: ?[]const u8, out: []u8) !void {
+            const custom = customization orelse &[_]u8{};
+
+            // Right-encode customization length (stack-allocated, no heap!)
+            const custom_len_enc = rightEncode(custom.len);
+
+            // Create zero-copy multi-slice view (no concatenation!)
+            const view = MultiSliceView.init(message, custom, custom_len_enc.slice());
+            const total_len = view.totalLen();
+
+            // Single chunk case - zero-copy absorption!
+            if (total_len <= B) {
+                singleChunkFn(&view, 0x07, out);
+                return;
+            }
+
+            // Tree mode - single-threaded SIMD processing
+            ktSingleThreaded(Variant, &view, total_len, out);
+        }
+
+        /// Hash with automatic parallelization for large inputs (>3-10MB depending on CPU count).
+        /// Automatically uses sequential processing for smaller inputs to avoid thread overhead.
+        /// Allocator required for thread pool and temporary buffers.
+        pub fn hashParallel(message: []const u8, customization: ?[]const u8, out: []u8, allocator: std.mem.Allocator) !void {
+            const custom = customization orelse &[_]u8{};
+
+            const custom_len_enc = rightEncode(custom.len);
+            const view = MultiSliceView.init(message, custom, custom_len_enc.slice());
+            const total_len = view.totalLen();
+
+            // Single chunk case
+            if (total_len <= B) {
+                singleChunkFn(&view, 0x07, out);
+                return;
+            }
+
+            // Use single-threaded processing if below threshold
+            const threshold = getLargeFileThreshold();
+            if (total_len < threshold) {
+                ktSingleThreaded(Variant, &view, total_len, out);
+                return;
+            }
+
+            // Tree mode - multi-threaded processing
+            try ktMultiThreaded(Variant, allocator, &view, total_len, out);
+        }
+    };
+}
+
 /// KangarooTwelve with 128-bit security (based on TurboSHAKE128).
 /// Provides 128-bit collision and preimage resistance.
-pub const KT128 = struct {
-    /// Hash a message using sequential processing with SIMD acceleration.
-    /// Best performance for inputs under 10MB. Never allocates memory.
-    ///
-    /// Parameters:
-    ///   - message: Input data to hash (any length)
-    ///   - customization: Optional domain separation string (or null)
-    ///   - out: Output buffer (any length, arbitrary output sizes supported)
-    pub fn hash(message: []const u8, customization: ?[]const u8, out: []u8) !void {
-        const custom = customization orelse &[_]u8{};
-
-        // Right-encode customization length (stack-allocated, no heap!)
-        const custom_len_enc = rightEncode(custom.len);
-
-        // Create zero-copy multi-slice view (no concatenation!)
-        const view = MultiSliceView.init(message, custom, custom_len_enc.slice());
-        const total_len = view.totalLen();
-
-        // Single chunk case - zero-copy absorption!
-        if (total_len <= B) {
-            turboSHAKE128MultiSliceToBuffer(&view, 0x07, out);
-            return;
-        }
-
-        // Tree mode - single-threaded SIMD processing
-        ktSingleThreaded(KT128Variant, &view, total_len, out);
-    }
-
-    /// Hash with automatic parallelization for large inputs (>3-10MB depending on CPU count).
-    /// Automatically uses sequential processing for smaller inputs to avoid thread overhead.
-    /// Allocator required for thread pool and temporary buffers.
-    pub fn hashParallel(message: []const u8, customization: ?[]const u8, out: []u8, allocator: std.mem.Allocator) !void {
-        const custom = customization orelse &[_]u8{};
-
-        const custom_len_enc = rightEncode(custom.len);
-        const view = MultiSliceView.init(message, custom, custom_len_enc.slice());
-        const total_len = view.totalLen();
-
-        // Single chunk case
-        if (total_len <= B) {
-            turboSHAKE128MultiSliceToBuffer(&view, 0x07, out);
-            return;
-        }
-
-        // Use single-threaded processing if below threshold
-        const threshold = getLargeFileThreshold();
-        if (total_len < threshold) {
-            ktSingleThreaded(KT128Variant, &view, total_len, out);
-            return;
-        }
-
-        // Tree mode - multi-threaded processing
-        try ktMultiThreaded(KT128Variant, allocator, &view, total_len, out);
-    }
-};
+pub const KT128 = KTHash(KT128Variant, turboSHAKE128MultiSliceToBuffer);
 
 /// KangarooTwelve with 256-bit security (based on TurboSHAKE256).
 /// Provides 256-bit collision and preimage resistance. Use when you need
 /// post-quantum security (NIST level 2) or extra conservative margins.
 /// For most applications, KT128 offers better performance with adequate security.
-pub const KT256 = struct {
-    /// Hash a message using sequential processing with SIMD acceleration.
-    /// Best performance for inputs under 10MB. Never allocates memory.
-    ///
-    /// Parameters:
-    ///   - message: Input data to hash (any length)
-    ///   - customization: Optional domain separation string (or null)
-    ///   - out: Output buffer (any length, arbitrary output sizes supported)
-    pub fn hash(message: []const u8, customization: ?[]const u8, out: []u8) !void {
-        const custom = customization orelse &[_]u8{};
-
-        const custom_len_enc = rightEncode(custom.len);
-        const view = MultiSliceView.init(message, custom, custom_len_enc.slice());
-        const total_len = view.totalLen();
-
-        if (total_len <= B) {
-            turboSHAKE256MultiSliceToBuffer(&view, 0x07, out);
-            return;
-        }
-
-        ktSingleThreaded(KT256Variant, &view, total_len, out);
-    }
-
-    /// Hash with automatic parallelization for large inputs (>3-10MB depending on CPU count).
-    /// Automatically uses sequential processing for smaller inputs to avoid thread overhead.
-    /// Allocator required for thread pool and temporary buffers.
-    pub fn hashParallel(message: []const u8, customization: ?[]const u8, out: []u8, allocator: std.mem.Allocator) !void {
-        const custom = customization orelse &[_]u8{};
-
-        const custom_len_enc = rightEncode(custom.len);
-        const view = MultiSliceView.init(message, custom, custom_len_enc.slice());
-        const total_len = view.totalLen();
-
-        if (total_len <= B) {
-            turboSHAKE256MultiSliceToBuffer(&view, 0x07, out);
-            return;
-        }
-
-        // Use single-threaded processing if below threshold
-        const threshold = getLargeFileThreshold();
-        if (total_len < threshold) {
-            ktSingleThreaded(KT256Variant, &view, total_len, out);
-            return;
-        }
-
-        try ktMultiThreaded(KT256Variant, allocator, &view, total_len, out);
-    }
-};
+pub const KT256 = KTHash(KT256Variant, turboSHAKE256MultiSliceToBuffer);
