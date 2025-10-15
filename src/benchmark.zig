@@ -282,11 +282,11 @@ pub fn main() !void {
         const result = try runBenchmark(test_case.name, data, allocator);
         try results.append(allocator, result);
 
-        print("  KT128 Sequential: {d:.2} ms, {d:.2} MB/s\n", .{ result.kt128_sequential_time_ms, result.kt128_sequential_mb_s });
-        print("  KT128 Parallel:   {d:.2} ms, {d:.2} MB/s\n", .{ result.kt128_parallel_time_ms, result.kt128_parallel_mb_s });
-        print("  TurboSHAKE128:    {d:.2} ms, {d:.2} MB/s\n", .{ result.turboshake128_time_ms, result.turboshake128_mb_s });
+        print("  SHA256:           {d:.2} ms, {d:.2} MB/s\n", .{ result.sha256_time_ms, result.sha256_mb_s });
         print("  BLAKE3:           {d:.2} ms, {d:.2} MB/s\n", .{ result.blake3_time_ms, result.blake3_mb_s });
-        print("  SHA256:           {d:.2} ms, {d:.2} MB/s\n\n", .{ result.sha256_time_ms, result.sha256_mb_s });
+        print("  TurboSHAKE128:    {d:.2} ms, {d:.2} MB/s\n", .{ result.turboshake128_time_ms, result.turboshake128_mb_s });
+        print("  KT128 Sequential: {d:.2} ms, {d:.2} MB/s\n", .{ result.kt128_sequential_time_ms, result.kt128_sequential_mb_s });
+        print("  KT128 Parallel:   {d:.2} ms, {d:.2} MB/s\n\n", .{ result.kt128_parallel_time_ms, result.kt128_parallel_mb_s });
     }
 
     // Summary table
@@ -295,7 +295,7 @@ pub fn main() !void {
     print("SUMMARY TABLE - All throughput values in MB/s\n", .{});
     print("=" ** 92 ++ "\n", .{});
     print("{s:<10} {s:>8} | {s:>11} {s:>11} {s:>11} {s:>11} {s:>11}\n", .{
-        "Size", "Chunks", "KT128-Seq", "KT128-Par", "TurboSH128", "BLAKE3", "SHA256"
+        "Size", "Chunks", "SHA256", "BLAKE3", "TurboSH128", "KT128-Seq", "KT128-Par"
     });
     print("{s:-<10} {s:->8} + {s:->11} {s:->11} {s:->11} {s:->11} {s:->11}\n", .{
         "", "", "", "", "", "", ""
@@ -316,11 +316,11 @@ pub fn main() !void {
         print("{s:<10} {d:>8} | {d:>11.2} {d:>11.2} {d:>11.2} {d:>11.2} {d:>11.2}\n", .{
             size_str,
             result.chunks,
+            result.sha256_mb_s,
+            result.blake3_mb_s,
+            result.turboshake128_mb_s,
             result.kt128_sequential_mb_s,
             result.kt128_parallel_mb_s,
-            result.turboshake128_mb_s,
-            result.blake3_mb_s,
-            result.sha256_mb_s,
         });
     }
 
