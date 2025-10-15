@@ -46,6 +46,7 @@ const RC = [12]u64{
 /// Generic KangarooTwelve variant builder.
 /// Creates a variant type with specific cryptographic parameters.
 fn KangarooVariant(
+    comptime security_level_bits: comptime_int,
     comptime rate_bytes: usize,
     comptime cv_size_bytes: usize,
     comptime StateTypeParam: type,
@@ -57,6 +58,7 @@ fn KangarooVariant(
     comptime allocFn: fn (Allocator, *const MultiSliceView, u8, usize) anyerror![]u8,
 ) type {
     return struct {
+        const security_level = security_level_bits;
         const rate = rate_bytes;
         const rate_in_lanes = rate_bytes / 8;
         const cv_size = cv_size_bytes;
@@ -81,6 +83,7 @@ fn KangarooVariant(
 
 /// KangarooTwelve with 128-bit security parameters
 const KT128Variant = KangarooVariant(
+    128, // Security level in bits
     168, // TurboSHAKE128 rate in bytes
     32, // Chaining value size in bytes
     TurboSHAKE128State,
@@ -94,6 +97,7 @@ const KT128Variant = KangarooVariant(
 
 /// KangarooTwelve with 256-bit security parameters
 const KT256Variant = KangarooVariant(
+    256, // Security level in bits
     136, // TurboSHAKE256 rate in bytes
     64, // Chaining value size in bytes
     TurboSHAKE256State,
@@ -827,6 +831,11 @@ fn KTHash(
     return struct {
         const Self = @This();
         const StateType = Variant.StateType;
+
+        /// The recommended output length, in bytes.
+        pub const digest_length = Variant.security_level / 8 * 2;
+        /// The block length, or rate, in bytes.
+        pub const block_length = Variant.rate;
 
         /// Options for KangarooTwelve can include a customization string for domain separation.
         pub const Options = struct {
