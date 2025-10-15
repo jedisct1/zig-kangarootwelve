@@ -66,7 +66,7 @@ try KT128.hash(message, null, &large_output);
 
 ### Parallel Hashing
 
-For large inputs (>25-50MB depending on CPU count), parallel processing can significantly improve performance:
+For large inputs (>3-10MB depending on CPU count), parallel processing can significantly improve performance:
 
 ```zig
 const KT128 = kangarootwelve.KT128;
@@ -78,7 +78,7 @@ var output: [32]u8 = undefined;
 try KT128.hashParallel(large_data, null, &output, allocator);
 ```
 
-The implementation automatically adjusts the threshold for parallel processing based on CPU count (25MB for 8+ cores, 35MB for 4-7 cores, 50MB for 1-3 cores).
+The implementation automatically adjusts the threshold for parallel processing based on CPU count (3MB for 8+ cores, 5MB for 4-7 cores, 10MB for 1-3 cores).
 
 ### Using KT256
 
@@ -120,8 +120,8 @@ Same API as `KT128`, but uses TurboSHAKE256 internally for 256-bit security.
 The implementation includes optimizations for both small and large inputs:
 
 - Small inputs (≤8KB): Single-pass processing with no chunking overhead
-- Medium inputs (8KB - ~50MB): Sequential chunked processing with SIMD acceleration
-- Large inputs (>~25-50MB): Parallel processing with dynamic thread pool sizing
+- Medium inputs (8KB - ~10MB): Sequential chunked processing with SIMD acceleration
+- Large inputs (>~3-10MB depending on CPU count): Parallel processing with dynamic thread pool sizing
 
 Benchmark your specific use case with:
 
