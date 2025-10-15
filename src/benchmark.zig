@@ -294,12 +294,8 @@ pub fn main() !void {
     print("=" ** 92 ++ "\n", .{});
     print("SUMMARY TABLE - All throughput values in MB/s\n", .{});
     print("=" ** 92 ++ "\n", .{});
-    print("{s:<10} {s:>8} | {s:>11} {s:>11} {s:>11} {s:>11} {s:>11}\n", .{
-        "Size", "Chunks", "SHA256", "BLAKE3", "TurboSH128", "KT128-Seq", "KT128-Par"
-    });
-    print("{s:-<10} {s:->8} + {s:->11} {s:->11} {s:->11} {s:->11} {s:->11}\n", .{
-        "", "", "", "", "", "", ""
-    });
+    print("{s:<10} {s:>8} | {s:>11} {s:>11} {s:>11} {s:>11} {s:>11}\n", .{ "Size", "Chunks", "SHA256", "BLAKE3", "TurboSH128", "KT128-Seq", "KT128-Par" });
+    print("{s:-<10} {s:->8} + {s:->11} {s:->11} {s:->11} {s:->11} {s:->11}\n", .{ "", "", "", "", "", "", "" });
 
     for (results.items) |result| {
         var size_buf: [16]u8 = undefined;
