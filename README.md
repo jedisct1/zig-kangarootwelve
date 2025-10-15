@@ -24,7 +24,7 @@ K12 provides 128-bit security strength, equivalent to AES-128 and SHAKE128, whic
 
 The current state of cryptanalysis shows attacks reaching 6 rounds of the Keccak permutation, leaving K12's 12 rounds with a substantial security margin. While this margin is smaller than SHA-3's (which has 24 rounds), it reflects a deliberate engineering trade-off: K12 sacrifices some conservative margin for significantly better performance, while maintaining strong practical security.
 
-### Standardization and Ongoing Review
+### Standardization
 
 The KangarooTwelve draft was proposed in 2016 and underwent 8 years of public scrutiny before being standardized as RFC 9861 in 2025.
 
