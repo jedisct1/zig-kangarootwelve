@@ -1,6 +1,6 @@
 # KangarooTwelve for Zig
 
-A pure Zig implementation of the KangarooTwelve (K12, RFC9861) cryptographic hash function with support for both sequential and parallel processing.
+A pure Zig implementation of the KangarooTwelve cryptographic hash function with support for both sequential and parallel processing.
 
 ## About KangarooTwelve
 
