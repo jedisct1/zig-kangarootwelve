@@ -579,12 +579,12 @@ fn TurboSHAKEState(comptime rate: usize) type {
 /// Streaming TurboSHAKE128 state for incremental hashing.
 /// Allows processing data in chunks without buffering everything in memory.
 /// Usage: init() -> update() (multiple times) -> finalize().
-pub const TurboSHAKE128State = TurboSHAKEState(168);
+const TurboSHAKE128State = TurboSHAKEState(168);
 
 /// Streaming TurboSHAKE256 state for incremental hashing.
 /// Allows processing data in chunks without buffering everything in memory.
 /// Usage: init() -> update() (multiple times) -> finalize().
-pub const TurboSHAKE256State = TurboSHAKEState(136);
+const TurboSHAKE256State = TurboSHAKEState(136);
 
 /// Process N leaves (8KiB chunks) in parallel - generic version
 fn processLeaves(comptime Variant: type, comptime N: usize, data: []const u8, result: *[N * Variant.cv_size]u8) void {
