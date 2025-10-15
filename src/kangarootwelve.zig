@@ -1,7 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const crypto = std.crypto;
-const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
 const Pool = Thread.Pool;
@@ -114,13 +113,11 @@ inline fn rol64Vec(comptime N: usize, v: @Vector(N, u64), comptime n: u6) @Vecto
 
 /// Load a 64-bit little-endian value
 inline fn load64(bytes: []const u8) u64 {
-    assert(bytes.len >= 8);
     return std.mem.readInt(u64, bytes[0..8], .little);
 }
 
 /// Store a 64-bit little-endian value
 inline fn store64(value: u64, bytes: []u8) void {
-    assert(bytes.len >= 8);
     std.mem.writeInt(u64, bytes[0..8], value, .little);
 }
 
@@ -298,7 +295,6 @@ fn addLanesAll(
     lane_count: usize,
     lane_offset: usize,
 ) void {
-    assert(data.len >= 8 * ((N - 1) * lane_offset + lane_count));
 
     // Process lanes (at most 25 lanes in Keccak state)
     inline for (0..25) |xy| {
@@ -536,8 +532,6 @@ fn processLeaves(
     data: []const u8,
     result: *[N * Variant.cv_size]u8,
 ) void {
-    assert(data.len >= N * chunk_size);
-
     const rate_in_lanes: usize = Variant.rate_in_lanes;
     const rate_in_bytes: usize = rate_in_lanes * 8;
     const cv_size: usize = Variant.cv_size;
