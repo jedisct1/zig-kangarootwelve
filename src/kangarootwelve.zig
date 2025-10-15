@@ -7,8 +7,8 @@ const Thread = std.Thread;
 const Pool = Thread.Pool;
 const WaitGroup = Thread.WaitGroup;
 
-const B: usize = 8192; // Chunk size for tree hashing (8 KiB)
-const CACHE_LINE_SIZE = std.atomic.cache_line;
+const chunk_size: usize = 8192; // Chunk size for tree hashing (8 KiB)
+const cache_line_size = std.atomic.cache_line;
 
 // Optimal SIMD vector length for u64 on this target platform
 const optimal_vector_len = std.simd.suggestVectorLength(u64) orelse 1;
@@ -491,14 +491,14 @@ const TurboSHAKE256State = crypto.hash.sha3.TurboShake256(0x06);
 
 /// Process N leaves (8KiB chunks) in parallel - generic version
 fn processLeaves(comptime Variant: type, comptime N: usize, data: []const u8, result: *[N * Variant.cv_size]u8) void {
-    assert(data.len >= N * B);
+    assert(data.len >= N * chunk_size);
 
     const rate_in_lanes: usize = Variant.rate_in_lanes;
     const rate_in_bytes: usize = rate_in_lanes * 8;
     const cv_size: usize = Variant.cv_size;
 
     // Initialize N all-zero states with cache alignment
-    var states: [5][5]@Vector(N, u64) align(CACHE_LINE_SIZE) = undefined;
+    var states: [5][5]@Vector(N, u64) align(cache_line_size) = undefined;
     inline for (0..5) |x| {
         inline for (0..5) |y| {
             states[x][y] = @splat(0);
@@ -507,15 +507,15 @@ fn processLeaves(comptime Variant: type, comptime N: usize, data: []const u8, re
 
     // Process complete blocks
     var j: usize = 0;
-    while (j + rate_in_bytes <= B) : (j += rate_in_bytes) {
-        addLanesAll(N, &states, data[j..], rate_in_lanes, B / 8);
+    while (j + rate_in_bytes <= chunk_size) : (j += rate_in_bytes) {
+        addLanesAll(N, &states, data[j..], rate_in_lanes, chunk_size / 8);
         keccakP1600timesN(N, &states);
     }
 
     // Process last incomplete block
-    const remaining_lanes = (B - j) / 8;
+    const remaining_lanes = (chunk_size - j) / 8;
     if (remaining_lanes > 0) {
-        addLanesAll(N, &states, data[j..], remaining_lanes, B / 8);
+        addLanesAll(N, &states, data[j..], remaining_lanes, chunk_size / 8);
     }
 
     // Add suffix 0x0B and padding
@@ -561,14 +561,14 @@ inline fn processNLeaves(
     output: []u8,
 ) void {
     const cv_size = Variant.cv_size;
-    if (view.tryGetSlice(j, j + N * B)) |leaf_data| {
+    if (view.tryGetSlice(j, j + N * chunk_size)) |leaf_data| {
         var leaf_cvs: [N * cv_size]u8 = undefined;
         processLeaves(Variant, N, leaf_data, &leaf_cvs);
         @memcpy(output[0..leaf_cvs.len], &leaf_cvs);
     } else {
-        view.copyRange(j, j + N * B, leaf_buffer[0 .. N * B]);
+        view.copyRange(j, j + N * chunk_size, leaf_buffer[0 .. N * chunk_size]);
         var leaf_cvs: [N * cv_size]u8 = undefined;
-        processLeaves(Variant, N, leaf_buffer[0 .. N * B], &leaf_cvs);
+        processLeaves(Variant, N, leaf_buffer[0 .. N * chunk_size], &leaf_cvs);
         @memcpy(output[0..leaf_cvs.len], &leaf_cvs);
     }
 }
@@ -576,25 +576,25 @@ inline fn processNLeaves(
 /// Process a batch of leaves in a single thread using SIMD
 fn processLeafBatch(comptime Variant: type, ctx: LeafBatchContext) void {
     const cv_size = Variant.cv_size;
-    const leaf_buffer = ctx.scratch_buffer[0 .. 8 * B];
-    const cv_scratch = ctx.scratch_buffer[8 * B .. 8 * B + cv_size];
+    const leaf_buffer = ctx.scratch_buffer[0 .. 8 * chunk_size];
+    const cv_scratch = ctx.scratch_buffer[8 * chunk_size .. 8 * chunk_size + cv_size];
 
     var cvs_offset: usize = 0;
     var j: usize = ctx.batch_start;
-    const batch_end = @min(ctx.batch_start + ctx.batch_count * B, ctx.total_len);
+    const batch_end = @min(ctx.batch_start + ctx.batch_count * chunk_size, ctx.total_len);
 
     // Process leaves using SIMD (8x, 4x, 2x) based on optimal vector length
     inline for ([_]usize{ 8, 4, 2 }) |batch_size| {
-        while (optimal_vector_len >= batch_size and j + batch_size * B <= batch_end) {
+        while (optimal_vector_len >= batch_size and j + batch_size * chunk_size <= batch_end) {
             processNLeaves(Variant, batch_size, ctx.view, j, leaf_buffer, ctx.output_cvs[cvs_offset..]);
             cvs_offset += batch_size * cv_size;
-            j += batch_size * B;
+            j += batch_size * chunk_size;
         }
     }
 
     // Process remaining single leaves
     while (j < batch_end) {
-        const chunk_len = @min(B, batch_end - j);
+        const chunk_len = @min(chunk_size, batch_end - j);
         if (ctx.view.tryGetSlice(j, j + chunk_len)) |leaf_data| {
             const cv_slice = MultiSliceView.init(leaf_data, &[_]u8{}, &[_]u8{});
             Variant.turboSHAKEToBuffer(&cv_slice, 0x0B, cv_scratch[0..cv_size]);
@@ -606,7 +606,7 @@ fn processLeafBatch(comptime Variant: type, ctx: LeafBatchContext) void {
             @memcpy(ctx.output_cvs[cvs_offset..][0..cv_size], cv_scratch[0..cv_size]);
         }
         cvs_offset += cv_size;
-        j += B;
+        j += chunk_size;
     }
 }
 
@@ -620,14 +620,14 @@ inline fn processAndAbsorbNLeaves(
     final_state: anytype,
 ) void {
     const cv_size = Variant.cv_size;
-    if (view.tryGetSlice(j, j + N * B)) |leaf_data| {
-        var leaf_cvs: [N * cv_size]u8 align(CACHE_LINE_SIZE) = undefined;
+    if (view.tryGetSlice(j, j + N * chunk_size)) |leaf_data| {
+        var leaf_cvs: [N * cv_size]u8 align(cache_line_size) = undefined;
         processLeaves(Variant, N, leaf_data, &leaf_cvs);
         final_state.update(&leaf_cvs);
     } else {
-        view.copyRange(j, j + N * B, leaf_buffer[0 .. N * B]);
-        var leaf_cvs: [N * cv_size]u8 align(CACHE_LINE_SIZE) = undefined;
-        processLeaves(Variant, N, leaf_buffer[0 .. N * B], &leaf_cvs);
+        view.copyRange(j, j + N * chunk_size, leaf_buffer[0 .. N * chunk_size]);
+        var leaf_cvs: [N * cv_size]u8 align(cache_line_size) = undefined;
+        processLeaves(Variant, N, leaf_buffer[0 .. N * chunk_size], &leaf_cvs);
         final_state.update(&leaf_cvs);
     }
 }
@@ -641,11 +641,11 @@ fn ktSingleThreaded(comptime Variant: type, view: *const MultiSliceView, total_l
     var final_state = StateType.init(.{});
 
     // Absorb first B bytes from input
-    var first_b_buffer: [B]u8 = undefined;
-    if (view.tryGetSlice(0, B)) |first_chunk| {
+    var first_b_buffer: [chunk_size]u8 = undefined;
+    if (view.tryGetSlice(0, chunk_size)) |first_chunk| {
         final_state.update(first_chunk);
     } else {
-        view.copyRange(0, B, &first_b_buffer);
+        view.copyRange(0, chunk_size, &first_b_buffer);
         final_state.update(&first_b_buffer);
     }
 
@@ -653,25 +653,25 @@ fn ktSingleThreaded(comptime Variant: type, view: *const MultiSliceView, total_l
     const padding = [_]u8{ 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
     final_state.update(&padding);
 
-    var j: usize = B;
+    var j: usize = chunk_size;
     var n: usize = 0;
 
     // Temporary buffers for boundary-spanning leaves and CV computation
-    var leaf_buffer: [B * 8]u8 align(CACHE_LINE_SIZE) = undefined;
+    var leaf_buffer: [chunk_size * 8]u8 align(cache_line_size) = undefined;
     var cv_buffer: [64]u8 = undefined; // Max CV size is 64 bytes
 
     // Process leaves in SIMD batches (8x, 4x, 2x)
     inline for ([_]usize{ 8, 4, 2 }) |batch_size| {
-        while (optimal_vector_len >= batch_size and j + batch_size * B <= total_len) {
+        while (optimal_vector_len >= batch_size and j + batch_size * chunk_size <= total_len) {
             processAndAbsorbNLeaves(Variant, batch_size, view, j, &leaf_buffer, &final_state);
-            j += batch_size * B;
+            j += batch_size * chunk_size;
             n += batch_size;
         }
     }
 
     // Process remaining leaves one at a time
     while (j < total_len) {
-        const chunk_len = @min(B, total_len - j);
+        const chunk_len = @min(chunk_size, total_len - j);
         if (view.tryGetSlice(j, j + chunk_len)) |leaf_data| {
             const cv_slice = MultiSliceView.init(leaf_data, &[_]u8{}, &[_]u8{});
             Variant.turboSHAKEToBuffer(&cv_slice, 0x0B, cv_buffer[0..cv_size]);
@@ -682,7 +682,7 @@ fn ktSingleThreaded(comptime Variant: type, view: *const MultiSliceView, total_l
             Variant.turboSHAKEToBuffer(&cv_slice, 0x0B, cv_buffer[0..cv_size]);
             final_state.update(cv_buffer[0..cv_size]);
         }
-        j += B;
+        j += chunk_size;
         n += 1;
     }
 
@@ -701,7 +701,7 @@ fn ktMultiThreaded(comptime Variant: type, allocator: Allocator, view: *const Mu
     const cv_size = Variant.cv_size;
 
     // Calculate total number of leaves
-    const total_leaves: usize = (total_len - 1) / B;
+    const total_leaves: usize = (total_len - 1) / chunk_size;
 
     // Allocate buffer for all chaining values
     const cvs = try allocator.alloc(u8, total_leaves * cv_size);
@@ -723,7 +723,7 @@ fn ktMultiThreaded(comptime Variant: type, allocator: Allocator, view: *const Mu
     const leaves_per_thread = (total_leaves + thread_count - 1) / thread_count;
 
     // Pre-allocate scratch buffers for all threads (8 leaves + CV size)
-    const scratch_size = 8 * B + cv_size;
+    const scratch_size = 8 * chunk_size + cv_size;
     const all_scratch = try allocator.alloc(u8, thread_count * scratch_size);
     defer allocator.free(all_scratch);
 
@@ -733,7 +733,7 @@ fn ktMultiThreaded(comptime Variant: type, allocator: Allocator, view: *const Mu
 
     while (leaves_assigned < total_leaves) {
         const batch_count = @min(leaves_per_thread, total_leaves - leaves_assigned);
-        const batch_start = B + leaves_assigned * B;
+        const batch_start = chunk_size + leaves_assigned * chunk_size;
         const cvs_offset = leaves_assigned * cv_size;
 
         const ctx = LeafBatchContext{
@@ -756,21 +756,21 @@ fn ktMultiThreaded(comptime Variant: type, allocator: Allocator, view: *const Mu
 
     // Build final node
     const n_enc = rightEncode(total_leaves);
-    const final_node_len = B + 8 + total_leaves * cv_size + n_enc.len + 2;
+    const final_node_len = chunk_size + 8 + total_leaves * cv_size + n_enc.len + 2;
     const final_node = try allocator.alloc(u8, final_node_len);
     defer allocator.free(final_node);
 
     // Copy first B bytes
-    if (view.tryGetSlice(0, B)) |first_chunk| {
-        @memcpy(final_node[0..B], first_chunk);
+    if (view.tryGetSlice(0, chunk_size)) |first_chunk| {
+        @memcpy(final_node[0..chunk_size], first_chunk);
     } else {
-        view.copyRange(0, B, final_node[0..B]);
+        view.copyRange(0, chunk_size, final_node[0..chunk_size]);
     }
 
-    @memset(final_node[B..][0..8], 0);
-    final_node[B] = 0x03;
-    @memcpy(final_node[B + 8 ..][0 .. total_leaves * cv_size], cvs);
-    @memcpy(final_node[B + 8 + total_leaves * cv_size ..][0..n_enc.len], n_enc.slice());
+    @memset(final_node[chunk_size..][0..8], 0);
+    final_node[chunk_size] = 0x03;
+    @memcpy(final_node[chunk_size + 8 ..][0 .. total_leaves * cv_size], cvs);
+    @memcpy(final_node[chunk_size + 8 + total_leaves * cv_size ..][0..n_enc.len], n_enc.slice());
     final_node[final_node_len - 2] = 0xFF;
     final_node[final_node_len - 1] = 0xFF;
 
@@ -803,7 +803,7 @@ fn KTHash(
             const total_len = view.totalLen();
 
             // Single chunk case - zero-copy absorption!
-            if (total_len <= B) {
+            if (total_len <= chunk_size) {
                 singleChunkFn(&view, 0x07, out);
                 return;
             }
@@ -823,7 +823,7 @@ fn KTHash(
             const total_len = view.totalLen();
 
             // Single chunk case
-            if (total_len <= B) {
+            if (total_len <= chunk_size) {
                 singleChunkFn(&view, 0x07, out);
                 return;
             }
