@@ -6,6 +6,9 @@ const Thread = std.Thread;
 const Pool = Thread.Pool;
 const WaitGroup = Thread.WaitGroup;
 
+const TurboSHAKE128State = crypto.hash.sha3.TurboShake128(0x06);
+const TurboSHAKE256State = crypto.hash.sha3.TurboShake256(0x06);
+
 const chunk_size: usize = 8192; // Chunk size for tree hashing (8 KiB)
 const cache_line_size = std.atomic.cache_line;
 
@@ -516,14 +519,6 @@ fn turboSHAKE256MultiSlice(
 ) ![]u8 {
     return turboSHAKEMultiSlice(136, allocator, view, separation_byte, output_len);
 }
-
-/// Streaming TurboSHAKE128 state from standard library for incremental hashing.
-/// Uses delimiter 0x06 for the final node in tree hashing.
-const TurboSHAKE128State = crypto.hash.sha3.TurboShake128(0x06);
-
-/// Streaming TurboSHAKE256 state from standard library for incremental hashing.
-/// Uses delimiter 0x06 for the final node in tree hashing.
-const TurboSHAKE256State = crypto.hash.sha3.TurboShake256(0x06);
 
 /// Process N leaves (8KiB chunks) in parallel - generic version
 fn processLeaves(
