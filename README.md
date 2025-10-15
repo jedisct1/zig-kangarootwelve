@@ -8,6 +8,26 @@ KangarooTwelve is a fast, secure cryptographic hash function based on Keccak (SH
 
 This implementation follows the specification from [RFC9861](https://www.rfc-editor.org/info/rfc9861) and provides both KT128 (based on TurboSHAKE128) and KT256 (based on TurboSHAKE256).
 
+## Security
+
+KangarooTwelve inherits its security foundation from over 15 years of intensive cryptanalysis of the Keccak permutation, the same primitive underlying SHA-3. This is not a new untested algorithm, but rather a performance-optimized variant of one of the most scrutinized cryptographic primitives in history.
+
+### Proven Cryptographic Foundation
+
+Keccak underwent rigorous analysis during the SHA-3 competition (2008-2012), where it was evaluated by the world's leading cryptographers before being selected by NIST as the SHA-3 standard. The scrutiny hasn't stopped—cryptanalysts continue to study Keccak-based functions, with the most recent significant analysis published at CRYPTO 2024. After all these years of analysis, Keccak's security remains solid.
+
+KangarooTwelve uses the Keccak-p[1600,12] permutation with 12 rounds, exactly half the 24 rounds used in SHA-3. This design choice was made by the original Keccak team themselves, who leveraged their deep understanding of the permutation's security properties. Any cryptanalysis of Keccak directly applies to understanding K12's security.
+
+### Security Strength and Margin
+
+K12 provides 128-bit security strength, equivalent to AES-128 and SHAKE128, which is sufficient for virtually all applications. For post-quantum security, K12 achieves NIST's security level 2 when using at least 256-bit outputs.
+
+The current state of cryptanalysis shows attacks reaching 6 rounds of the Keccak permutation, leaving K12's 12 rounds with a substantial security margin. While this margin is smaller than SHA-3's (which has 24 rounds), it reflects a deliberate engineering trade-off: K12 sacrifices some conservative margin for significantly better performance, while maintaining strong practical security.
+
+### Standardization and Ongoing Review
+
+The KangarooTwelve draft was proposed in 2016 and underwent 8 years of public scrutiny before being standardized as RFC 9861 in 2025.
+
 ## Installation
 
 Add this package to your `build.zig.zon`:
@@ -192,4 +212,3 @@ Size         Chunks |      SHA256      BLAKE3  BLAKE3-Par  TurboSH128   KT128-Se
 200 MB        25600 |     2309.76     1518.42     8022.78      136.58     2468.34     9471.04
 ==========================================================================================================
 ```
-
