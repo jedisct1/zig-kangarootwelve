@@ -17,9 +17,6 @@ const optimal_vector_len = std.simd.suggestVectorLength(u64) orelse 1;
 // Number of bytes processed per SIMD batch in multi-threaded mode
 const bytes_per_batch = 256 * 1024;
 
-// Number of leaves (chunks) per batch - derived from bytes_per_batch
-const leaves_per_batch = bytes_per_batch / chunk_size;
-
 // Multi-threading threshold: inputs larger than this will use parallel processing.
 // Benchmarked optimal value for ReleaseFast mode.
 const large_file_threshold: usize = 2 * 1024 * 1024; // 2 MB
@@ -881,6 +878,9 @@ fn ktMultiThreaded(
     const has_partial_leaf = (remaining_bytes % chunk_size) != 0;
     const partial_leaf_size = if (has_partial_leaf) remaining_bytes % chunk_size else 0;
 
+    // Number of leaves (chunks) per batch in multi-threaded mode
+    const leaves_per_batch = bytes_per_batch / chunk_size;
+
     // Calculate number of full thread tasks based on complete leaves only
     const num_full_tasks = full_leaves / leaves_per_batch;
     const remaining_full_leaves = full_leaves % leaves_per_batch;
@@ -1326,9 +1326,12 @@ test "KT128 sequential and parallel produce same output for large inputs" {
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
     const random = prng.random();
 
-    // Test with large input sizes that trigger parallel processing
-    // The threshold is 3-10MB depending on CPU count, so we test above that
-    const test_sizes = [_]usize{ 11 * 1024 * 1024, 20 * 1024 * 1024 }; // 11MB, 20MB
+    // Test with input sizes above the 2MB threshold to trigger parallel processing.
+    // Include a size with partial final leaf to stress boundary handling.
+    const test_sizes = [_]usize{
+        5 * 512 * 1024, // 2.5 MB
+        5 * 512 * 1024 + 8191, // 2.5 MB + 8191B (partial leaf)
+    };
 
     for (test_sizes) |size| {
         const input = try allocator.alloc(u8, size);
@@ -1445,13 +1448,11 @@ test "KT256 sequential and parallel produce same output for large inputs" {
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
     const random = prng.random();
 
-    // Test with large input sizes that trigger parallel processing, including
-    // a size that is just shy of a multiple of the 8KiB chunk to stress the
-    // final partial leaf.
+    // Test with input sizes above the 2MB threshold to trigger parallel processing.
+    // Include a size with partial final leaf to stress boundary handling.
     const test_sizes = [_]usize{
-        11 * 1024 * 1024, // 11MB
-        20 * 1024 * 1024, // 20MB
-        11 * 1024 * 1024 + 8191, // 11MB + 8191B
+        5 * 512 * 1024, // 2.5 MB
+        5 * 512 * 1024 + 8191, // 2.5 MB + 8191B (partial leaf)
     };
 
     for (test_sizes) |size| {
