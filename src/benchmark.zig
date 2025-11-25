@@ -15,30 +15,31 @@ fn turboShake128Hash(message: []const u8, output: []u8) void {
 
 // Simple timer for benchmarking
 const Timer = struct {
-    start: i128,
-    end: i128,
+    start: std.time.Instant,
+    end: std.time.Instant,
 
     fn init() @This() {
+        const now = std.time.Instant.now() catch unreachable;
         return @This(){
-            .start = std.time.nanoTimestamp(),
-            .end = 0,
+            .start = now,
+            .end = now,
         };
     }
 
     fn startTimer(self: *@This()) void {
-        self.start = std.time.nanoTimestamp();
+        self.start = std.time.Instant.now() catch unreachable;
     }
 
     fn stopTimer(self: *@This()) void {
-        self.end = std.time.nanoTimestamp();
+        self.end = std.time.Instant.now() catch unreachable;
     }
 
-    fn elapsed(self: @This()) i128 {
-        return self.end - self.start;
+    fn elapsed(self: @This()) u64 {
+        return self.end.since(self.start);
     }
 
     fn elapsedMillis(self: @This()) u64 {
-        return @intCast(@divTrunc(self.elapsed(), 1_000_000));
+        return self.elapsed() / 1_000_000;
     }
 
     fn elapsedMillisFloat(self: @This()) f64 {
@@ -82,7 +83,7 @@ fn formatBytes(buffer: []u8, bytes: usize) []const u8 {
     return std.fmt.bufPrint(buffer, "{d:.2} {s}", .{ value, unit }) catch unreachable;
 }
 
-fn runBenchmark(name: []const u8, message: []const u8, allocator: std.mem.Allocator) !BenchmarkResult {
+fn runBenchmark(name: []const u8, message: []const u8, allocator: std.mem.Allocator, io: std.Io) !BenchmarkResult {
     var out_kt128_seq: [32]u8 = undefined;
     var out_kt128_par: [32]u8 = undefined;
     var out_turboshake128: [32]u8 = undefined;
@@ -110,7 +111,7 @@ fn runBenchmark(name: []const u8, message: []const u8, allocator: std.mem.Alloca
     var timer_kt128_seq = Timer.init();
     timer_kt128_seq.startTimer();
     for (0..iterations) |_| {
-        try KT128.hash(message, null, &out_kt128_seq);
+        try KT128.hash(message, &out_kt128_seq, .{});
         std.mem.doNotOptimizeAway(&out_kt128_seq);
     }
     timer_kt128_seq.stopTimer();
@@ -120,7 +121,7 @@ fn runBenchmark(name: []const u8, message: []const u8, allocator: std.mem.Alloca
     var timer_kt128_par = Timer.init();
     timer_kt128_par.startTimer();
     for (0..iterations) |_| {
-        try KT128.hashParallel(message, null, &out_kt128_par, allocator);
+        try KT128.hashParallel(message, &out_kt128_par, .{}, allocator, io);
         std.mem.doNotOptimizeAway(&out_kt128_par);
     }
     timer_kt128_par.stopTimer();
@@ -223,6 +224,10 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
+    var threaded = std.Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
     print("Hash Algorithm Benchmark: KT128 vs TurboSHAKE128 vs BLAKE3 vs SHA256\n", .{});
     print("======================================================================\n\n", .{});
 
@@ -238,7 +243,7 @@ pub fn main() !void {
         .{ .size = 209_715_200, .name = "200 MB" },
     };
 
-    var results = std.ArrayList(BenchmarkResult){};
+    var results: std.ArrayList(BenchmarkResult) = .{};
     defer results.deinit(allocator);
 
     for (test_sizes) |test_case| {
@@ -248,7 +253,7 @@ pub fn main() !void {
 
         print("Benchmarking {s} ({d} chunks)...\n", .{ test_case.name, (test_case.size + 8192 - 1) / 8192 });
 
-        const result = try runBenchmark(test_case.name, data, allocator);
+        const result = try runBenchmark(test_case.name, data, allocator, io);
         try results.append(allocator, result);
 
         print("  SHA256:           {d:.2} ms, {d:.2} MB/s\n", .{ result.sha256_time_ms, result.sha256_mb_s });
