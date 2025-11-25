@@ -887,7 +887,7 @@ fn ktMultiThreaded(
         var next_to_process: usize = 0;
 
         while (next_to_process < total_batches) {
-            while (batches_spawned < total_batches and select.outstanding < max_concurrent) {
+            while (batches_spawned < total_batches and batches_spawned - next_to_process < max_concurrent) {
                 const batch_start_leaf = batches_spawned * leaves_per_batch;
                 const batch_leaves = @min(leaves_per_batch, full_leaves - batch_start_leaf);
                 const start_offset = chunk_size + batch_start_leaf * chunk_size;
