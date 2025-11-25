@@ -15,7 +15,7 @@ const cache_line_size = std.atomic.cache_line;
 const optimal_vector_len = std.simd.suggestVectorLength(u64) orelse 1;
 
 // Number of bytes processed per SIMD batch in multi-threaded mode
-const bytes_per_batch = optimal_vector_len * chunk_size;
+const bytes_per_batch = 256 * 1024;
 
 // Number of leaves (chunks) per batch - derived from bytes_per_batch
 const leaves_per_batch = bytes_per_batch / chunk_size;
@@ -831,6 +831,8 @@ fn ktMultiThreaded(
     total_len: usize,
     output: []u8,
 ) !void {
+    comptime std.debug.assert(bytes_per_batch % (optimal_vector_len * chunk_size) == 0);
+
     const cv_size = Variant.cv_size;
 
     // Calculate total leaves after the first chunk
