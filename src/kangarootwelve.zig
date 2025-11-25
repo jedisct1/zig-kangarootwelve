@@ -1521,6 +1521,176 @@ test "KT256 sequential and parallel produce same output with customization" {
     try std.testing.expectEqualSlices(u8, &output_seq, &output_par);
 }
 
+test "KT128 parallel: boundary tests around chunk and batch sizes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Test sizes carefully chosen to exercise boundary conditions:
+    // - chunk_size = 8192 bytes
+    // - bytes_per_batch = 256KB (32 chunks after first)
+    // - large_file_threshold = 2MB
+    // - leaves_per_batch = 32
+    //
+    // For parallel mode, after the first 8192-byte chunk, remaining bytes
+    // are divided into leaves of chunk_size bytes each.
+    const test_sizes = [_]usize{
+        // Around large_file_threshold (2MB = 2097152)
+        large_file_threshold - 1, // Just below threshold (sequential)
+        large_file_threshold, // Exactly at threshold (sequential)
+        large_file_threshold + 1, // Just above threshold (parallel, 1 partial leaf)
+        large_file_threshold + chunk_size, // One full extra leaf
+            // Exactly N full batches (no partial leaf, no remaining leaves)
+            // Pattern: first_chunk + N * leaves_per_batch * chunk_size
+        chunk_size + 1 * (bytes_per_batch / chunk_size) * chunk_size, // 1 batch
+        chunk_size + 2 * (bytes_per_batch / chunk_size) * chunk_size, // 2 batches
+        chunk_size + 3 * (bytes_per_batch / chunk_size) * chunk_size, // 3 batches
+
+        // Batches + 1 extra leaf (tests remaining_full_leaves path)
+        chunk_size + 1 * (bytes_per_batch / chunk_size) * chunk_size + chunk_size,
+        chunk_size + 2 * (bytes_per_batch / chunk_size) * chunk_size + chunk_size,
+
+        // Batches + partial leaf (tests has_partial_leaf path)
+        chunk_size + 1 * (bytes_per_batch / chunk_size) * chunk_size + 1,
+        chunk_size + 1 * (bytes_per_batch / chunk_size) * chunk_size + chunk_size - 1,
+        chunk_size + 2 * (bytes_per_batch / chunk_size) * chunk_size + 4096,
+            // Large sizes to stress pending buffer slot reuse
+            // With max_concurrent = 256 and leaves_per_batch = 32:
+            // To get 257 batches: first_chunk + 257 * 32 * chunk_size
+        chunk_size + 10 * (bytes_per_batch / chunk_size) * chunk_size, // 10 batches
+        chunk_size + 10 * (bytes_per_batch / chunk_size) * chunk_size + 1, // 10 batches + partial
+    };
+
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    const random = prng.random();
+
+    for (test_sizes) |size| {
+        const input = try allocator.alloc(u8, size);
+        defer allocator.free(input);
+        random.bytes(input);
+
+        var output_seq: [32]u8 = undefined;
+        var output_par: [32]u8 = undefined;
+
+        try KT128.hash(input, &output_seq, .{});
+        try KT128.hashParallel(input, &output_par, .{}, allocator, io);
+
+        try std.testing.expectEqualSlices(u8, &output_seq, &output_par);
+    }
+}
+
+test "KT128 parallel: stress test with many batch counts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Skip in debug mode to avoid long test times
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    const random = prng.random();
+
+    const leaves_per_batch = bytes_per_batch / chunk_size;
+
+    // Test many different batch counts to stress slot reuse logic
+    // Range from 1 to 300 batches (exceeds max_concurrent=256)
+    var batch_count: usize = 1;
+    while (batch_count <= 300) : (batch_count += 1) {
+        // Calculate size for exactly batch_count full batches
+        const size = chunk_size + batch_count * leaves_per_batch * chunk_size;
+
+        const input = try allocator.alloc(u8, size);
+        defer allocator.free(input);
+        random.bytes(input);
+
+        var output_seq: [32]u8 = undefined;
+        var output_par: [32]u8 = undefined;
+
+        try KT128.hash(input, &output_seq, .{});
+        try KT128.hashParallel(input, &output_par, .{}, allocator, io);
+
+        try std.testing.expectEqualSlices(u8, &output_seq, &output_par);
+    }
+}
+
+test "KT128 parallel: slot reuse edge cases" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    const random = prng.random();
+
+    const leaves_per_batch = bytes_per_batch / chunk_size;
+    const max_concurrent: usize = 256;
+
+    // Test sizes that would cause slot collisions if the spawn condition is wrong
+    // These sizes create exactly max_concurrent+N batches, where slot reuse is critical
+    const test_batch_counts = [_]usize{
+        max_concurrent - 1, // Just under max_concurrent
+        max_concurrent, // Exactly max_concurrent
+        max_concurrent + 1, // First slot reuse
+        max_concurrent + 2, // Second slot reuse
+        max_concurrent * 2, // All slots reused once
+        max_concurrent * 2 + 1, // Start of second reuse cycle
+    };
+
+    for (test_batch_counts) |batch_count| {
+        // Skip very large allocations in constrained environments
+        if (builtin.mode == .Debug and batch_count > max_concurrent) continue;
+
+        const size = chunk_size + batch_count * leaves_per_batch * chunk_size;
+
+        const input = try allocator.alloc(u8, size);
+        defer allocator.free(input);
+        random.bytes(input);
+
+        var output_seq: [32]u8 = undefined;
+        var output_par: [32]u8 = undefined;
+
+        try KT128.hash(input, &output_seq, .{});
+        try KT128.hashParallel(input, &output_par, .{}, allocator, io);
+
+        try std.testing.expectEqualSlices(u8, &output_seq, &output_par);
+    }
+}
+
+test "KT256 parallel: boundary tests around chunk and batch sizes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const test_sizes = [_]usize{
+        // Around large_file_threshold
+        large_file_threshold + 1,
+        large_file_threshold + chunk_size,
+
+        // Exactly N full batches
+        chunk_size + 1 * (bytes_per_batch / chunk_size) * chunk_size,
+        chunk_size + 2 * (bytes_per_batch / chunk_size) * chunk_size,
+
+        // Batches + partial leaf
+        chunk_size + 1 * (bytes_per_batch / chunk_size) * chunk_size + 1,
+        chunk_size + 2 * (bytes_per_batch / chunk_size) * chunk_size + chunk_size - 1,
+
+        // Multiple batches for slot reuse
+        chunk_size + 10 * (bytes_per_batch / chunk_size) * chunk_size,
+    };
+
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    const random = prng.random();
+
+    for (test_sizes) |size| {
+        const input = try allocator.alloc(u8, size);
+        defer allocator.free(input);
+        random.bytes(input);
+
+        var output_seq: [64]u8 = undefined;
+        var output_par: [64]u8 = undefined;
+
+        try KT256.hash(input, &output_seq, .{});
+        try KT256.hashParallel(input, &output_par, .{}, allocator, io);
+
+        try std.testing.expectEqualSlices(u8, &output_seq, &output_par);
+    }
+}
+
 /// Helper: Generate pattern data where data[i] = (i % 251)
 fn generatePattern(allocator: Allocator, len: usize) ![]u8 {
     const data = try allocator.alloc(u8, len);
