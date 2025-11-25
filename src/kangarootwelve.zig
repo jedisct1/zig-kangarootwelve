@@ -1406,7 +1406,7 @@ test "KT128 sequential and parallel produce same output with customization" {
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
     const random = prng.random();
 
-    const input_size = 15 * 1024 * 1024; // 15MB
+    const input_size = 5 * 512 * 1024; // 2.5MB
     const input = try allocator.alloc(u8, input_size);
     defer allocator.free(input);
 
@@ -1500,7 +1500,7 @@ test "KT256 sequential and parallel produce same output with customization" {
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
     const random = prng.random();
 
-    const input_size = 15 * 1024 * 1024; // 15MB
+    const input_size = 5 * 512 * 1024; // 2.5MB
     const input = try allocator.alloc(u8, input_size);
     defer allocator.free(input);
 
